@@ -172,7 +172,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             }
 
             SectionTitle("关于与开源许可")
-            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.1.1 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.1.2 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
             SettingRow(
                 title = "基于 deepseek-ai/chat-demo",
                 subtitle = "MIT License · Copyright (c) 2026 DeepSeek",

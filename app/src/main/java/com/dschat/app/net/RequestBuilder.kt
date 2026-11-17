@@ -24,10 +24,15 @@ import java.util.Locale
  */
 object RequestBuilder {
 
+    /**
+     * 服务端约定格式：<date>,<weekday>,<location>,<platform>,<language>
+     * date 必须 YYYY-MM-DD；weekday 用提醒语言（中文）；location 可空；
+     * platform 仅接受 App / Web；language 为受支持的语言本名。
+     */
     fun latestReminder(now: Date = Date()): String {
-        val date = SimpleDateFormat("yyyy/M/d", Locale.getDefault()).format(now)
+        val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(now)
         val weekday = SimpleDateFormat("EEEE", Locale.CHINESE).format(now)
-        return listOf(date, weekday, "", "Android", "中文").joinToString(",")
+        return listOf(date, weekday, "", "App", "中文").joinToString(",")
     }
 
     /** 助手历史 → content 块：仅文本，相邻合并、隔开的用空行连接 */
