@@ -13,8 +13,8 @@ android {
         applicationId = "com.dschat.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.1.2"
+        versionCode = 3
+        versionName = "0.1.3"
         resourceConfigurations += listOf("zh", "en")
     }
 
@@ -36,6 +36,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"

@@ -26,6 +26,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Search
@@ -40,6 +41,7 @@ import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -200,10 +202,20 @@ fun ChatScreen(
     val messages = active?.messages ?: emptyList()
     val streaming = streamingId != null && streamingId == active?.id
 
-    // 新消息 / 流式更新时滚动到底部
-    LaunchedEffect(messages.size, messages.lastOrNull()?.blocks?.size, messages.lastOrNull()?.replyText?.length) {
+    // 是否处于底部：决定流式输出时是否自动跟随（手动上滑后不再打扰）
+    val isAtBottom by remember { derivedStateOf { !listState.canScrollForward } }
+    val lastTick = messages.lastOrNull()?.let { it.blocks.size * 100000 + it.replyText.length } ?: 0
+
+    // 消息条数变化（发送/新回复）：平滑滚到底部
+    LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size - 1)
+            listState.animateScrollToItem(messages.lastIndex, Int.MAX_VALUE)
+        }
+    }
+    // 流式内容增长：仅在底部时即时跟随，避免与手动滚动手势冲突
+    LaunchedEffect(lastTick) {
+        if (messages.isNotEmpty() && isAtBottom) {
+            listState.scrollToItem(messages.lastIndex, Int.MAX_VALUE)
         }
     }
 
@@ -261,24 +273,53 @@ fun ChatScreen(
                     )
                 }
             } else {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                        start = 16.dp, end = 16.dp, top = 8.dp, bottom = 8.dp,
-                    ),
-                ) {
-                    itemsIndexed(messages, key = { _, m -> m.id }) { index, message ->
-                        if (message.role == "user") {
-                            UserMessageView(message)
-                        } else {
-                            AssistantMessageView(
-                                message = message,
-                                isLast = index == messages.lastIndex,
-                                onRetry = vm::retryLast,
-                                onContinue = vm::continueLast,
-                                onCopied = { vm.toast("已复制") },
-                            )
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            start = 16.dp, end = 16.dp, top = 8.dp, bottom = 8.dp,
+                        ),
+                    ) {
+                        itemsIndexed(messages, key = { _, m -> m.id }) { index, message ->
+                            if (message.role == "user") {
+                                UserMessageView(message)
+                            } else {
+                                AssistantMessageView(
+                                    message = message,
+                                    isLast = index == messages.lastIndex,
+                                    onRetry = vm::retryLast,
+                                    onContinue = vm::continueLast,
+                                    onCopied = { vm.toast("已复制") },
+                                )
+                            }
+                        }
+                    }
+                    // 不在底部时显示回底小箭头
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = !isAtBottom && messages.isNotEmpty(),
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp),
+                        enter = androidx.compose.animation.fadeIn(),
+                        exit = androidx.compose.animation.fadeOut(),
+                    ) {
+                        androidx.compose.material3.Surface(
+                            shape = CircleShape,
+                            color = ds.layer3,
+                            shadowElevation = 4.dp,
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clickable {
+                                    scope.launch { listState.animateScrollToItem(messages.lastIndex, Int.MAX_VALUE) }
+                                },
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Filled.KeyboardArrowDown,
+                                    "回到底部",
+                                    tint = ds.labelSecondary,
+                                    modifier = Modifier.size(22.dp),
+                                )
+                            }
                         }
                     }
                 }

@@ -22,6 +22,7 @@ import com.dschat.app.ui.ApiKeyScreen
 import com.dschat.app.ui.ChatScreen
 import com.dschat.app.ui.ChatViewModel
 import com.dschat.app.ui.SettingsScreen
+import com.dschat.app.ui.UpdateDialog
 import com.dschat.app.ui.theme.DeepSeekTheme
 import com.dschat.app.ui.theme.LocalDsColors
 
@@ -40,6 +41,11 @@ class MainActivity : ComponentActivity() {
                 vm.toast.collect { snackbar.showSnackbar(it) }
             }
 
+            // 启动时静默检查更新（有 Key 后）
+            LaunchedEffect(hasKey) {
+                if (hasKey) vm.checkUpdate(manual = false)
+            }
+
             DeepSeekTheme(theme) {
                 val ds = LocalDsColors.current
                 Scaffold(
@@ -56,6 +62,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+                UpdateDialog(vm)
             }
         }
     }

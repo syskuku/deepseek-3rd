@@ -1,8 +1,15 @@
 package com.dschat.app.ui
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.dschat.app.BuildConfig
 import com.dschat.app.DeepSeekApp
 import com.dschat.app.data.ChatMessage
 import com.dschat.app.data.HistoryArchive
@@ -17,6 +24,7 @@ import com.dschat.app.net.ApiErrorKind
 import com.dschat.app.net.DeepSeekClient
 import com.dschat.app.net.RequestBuilder
 import com.dschat.app.net.StreamEvent
+import com.dschat.app.net.UpdateChecker
 import com.dschat.app.net.classifyError
 import com.dschat.app.net.isRetryable
 import kotlinx.coroutines.CancellationException
@@ -34,6 +42,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -462,5 +471,101 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         } finally {
             _busy.value = false
         }
+    }
+
+    // ------------------------------------------------------------ in-app update
+
+    private val _updateInfo = MutableStateFlow<UpdateChecker.UpdateInfo?>(null)
+    val updateInfo: StateFlow<UpdateChecker.UpdateInfo?> = _updateInfo
+
+    /** null = 未在下载；0..1 = 进度 */
+    private val _updateProgress = MutableStateFlow<Float?>(null)
+    val updateProgress: StateFlow<Float?> = _updateProgress
+
+    private val _downloadedApk = MutableStateFlow<File?>(null)
+    val downloadedApk: StateFlow<File?> = _downloadedApk
+
+    private val _updateError = MutableStateFlow<String?>(null)
+    val updateError: StateFlow<String?> = _updateError
+
+    private var updateJob: Job? = null
+
+    /** 检查 GitHub 最新 Release；manual=true 时无更新也提示 */
+    fun checkUpdate(manual: Boolean) {
+        if (updateJob?.isActive == true) return
+        updateJob = viewModelScope.launch {
+            try {
+                val info = UpdateChecker.fetchLatest()
+                if (info != null && UpdateChecker.isNewer(info.version, BuildConfig.VERSION_NAME)) {
+                    _updateInfo.value = info
+                    _updateError.value = null
+                } else if (manual) {
+                    toast("已是最新版本（v${BuildConfig.VERSION_NAME}）")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (manual) toast("检查更新失败：${e.message ?: "网络异常"}")
+            }
+        }
+    }
+
+    fun dismissUpdate() {
+        updateJob?.cancel()
+        _updateInfo.value = null
+        _updateProgress.value = null
+        _updateError.value = null
+    }
+
+    fun downloadUpdate(context: Context) {
+        val info = _updateInfo.value ?: return
+        if (updateJob?.isActive == true) return
+        updateJob = viewModelScope.launch {
+            _updateProgress.value = 0f
+            _updateError.value = null
+            try {
+                val file = UpdateChecker.download(context.applicationContext, info.apkUrl) { p ->
+                    _updateProgress.value = p
+                }
+                _downloadedApk.value = file
+                _updateProgress.value = null
+                installUpdate(context)
+            } catch (e: CancellationException) {
+                _updateProgress.value = null
+                throw e
+            } catch (e: Exception) {
+                _updateProgress.value = null
+                _updateError.value = "下载失败：${e.message ?: "网络异常"}"
+            }
+        }
+    }
+
+    fun cancelDownload() {
+        updateJob?.cancel()
+        _updateProgress.value = null
+    }
+
+    /** 通过 FileProvider 调起系统安装器；未授权未知来源时先跳转设置 */
+    fun installUpdate(context: Context) {
+        val file = _downloadedApk.value ?: return
+        if (Build.VERSION.SDK_INT >= 26 && !context.packageManager.canRequestPackageInstalls()) {
+            runCatching {
+                context.startActivity(
+                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            }
+            toast("请允许安装未知应用，返回后点击「安装」")
+            return
+        }
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        runCatching {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                },
+            )
+        }.onFailure { toast("无法启动安装器：${it.message}") }
     }
 }

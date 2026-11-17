@@ -16,6 +16,8 @@
 - **Markdown 渲染**（Markwon：表格、删除线、链接）
 - **历史导入 / 导出**：兼容 DeepSeek 官方 `export_format_version: 3` ZIP 归档（`manifest.json` + `chat_session_index.json` + `chat_sessions/{id}.json` 消息树），导入前确认覆盖，导出文件名 `deepseek_data-日期.zip`，不含 API Key
 - **浅色 / 深色 / 跟随系统**主题，设计令牌逐行对照原版 `theme.css`
+- **智能自动滚动**：流式输出仅在底部时跟随，手动上滑不被打断；离底时显示回底箭头
+- **应用内更新**：启动静默检查 GitHub 最新 Release（设置 → 关于 → 检查更新），弹窗下载并调起系统安装器覆盖升级，直连失败自动切换镜像
 - 拒绝回复（`refusal`）按协议丢弃正文与思考，展示模板提示
 
 ## 与原版差异（v0.1.1）

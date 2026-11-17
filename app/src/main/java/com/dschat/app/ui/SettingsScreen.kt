@@ -172,7 +172,14 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             }
 
             SectionTitle("关于与开源许可")
-            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.1.2 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.1.3 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(
+                title = "检查更新",
+                subtitle = "从 GitHub Releases 获取最新版本",
+                onClick = { vm.checkUpdate(manual = true) },
+            ) {
+                Icon(Icons.Filled.ChevronRight, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
+            }
             SettingRow(
                 title = "基于 deepseek-ai/chat-demo",
                 subtitle = "MIT License · Copyright (c) 2026 DeepSeek",
