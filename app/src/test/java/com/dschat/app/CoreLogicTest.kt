@@ -189,6 +189,43 @@ class HistoryArchiveTest {
 class SessionTreeTest {
 
     @Test
+    fun appendRoundKeepsLinearAndVisible() {
+        // 回归：send 路径必须让提问与回复都落在可见路径上，且第二轮不产生分叉
+        val t = 1000L
+        var s = Session("s", "", t, t, emptyList())
+        val u1 = ChatMessage("u1", "user", t, content = "第一问")
+        val a1 = ChatMessage("a1", "assistant", t + 1, blocks = listOf(ReplyBlock.Text("第一答")))
+        s = s.appendRound(u1, a1)
+        assertEquals(listOf("u1", "a1"), s.visibleMessages().map { it.id })
+        assertEquals("a1", s.messages.first { it.id == "u1" }.selectedChildId)
+
+        val u2 = ChatMessage("u2", "user", t + 2, content = "第二问")
+        val a2 = ChatMessage("a2", "assistant", t + 3, blocks = listOf(ReplyBlock.Text("第二答")))
+        s = s.appendRound(u2, a2)
+        assertEquals(listOf("u1", "a1", "u2", "a2"), s.visibleMessages().map { it.id })
+        // 第二轮提问挂在第一答之下，不是第一问的兄弟
+        assertEquals("a1", s.messages.first { it.id == "u2" }.parentId)
+        assertEquals(1, s.siblingsOf(s.messages.first { it.id == "u2" }).size)
+        assertEquals(1, s.siblingsOf(s.messages.first { it.id == "a1" }).size)
+    }
+
+    @Test
+    fun appendRoundAfterErrorStillLinear() {
+        val t = 1000L
+        var s = Session("s", "", t, t, emptyList())
+        s = s.appendRound(
+            ChatMessage("u1", "user", t, content = "q"),
+            ChatMessage("a1", "assistant", t + 1, status = "error", errorText = "x"),
+        )
+        s = s.appendRound(
+            ChatMessage("u2", "user", t + 2, content = "q2"),
+            ChatMessage("a2", "assistant", t + 3, blocks = listOf(ReplyBlock.Text("ok"))),
+        )
+        assertEquals(4, s.visibleMessages().size)
+        assertEquals("a1", s.messages.first { it.id == "u2" }.parentId)
+    }
+
+    @Test
     fun normalizeLinearSession() {
         val t = 1000L
         val s = Session(

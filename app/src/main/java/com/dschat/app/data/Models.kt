@@ -136,4 +136,20 @@ data class Session(
         }
         return copy(messages = linked, rootMessageId = linked.first().id)
     }
+
+    /**
+     * 追加一轮「提问 + 回复」并正确链接分支（官方 appendBranch 语义）：
+     * 提问挂在当前路径末尾节点下，回复挂在提问下且被提问选中。
+     * 缺少任何一条链接都会导致回复不可见或后续提问错误分叉。
+     */
+    fun appendRound(user: ChatMessage, assistant: ChatMessage): Session {
+        val parentId = visibleMessages().lastOrNull()?.id
+        val u = user.copy(parentId = parentId, selectedChildId = assistant.id)
+        val a = assistant.copy(parentId = u.id)
+        return copy(
+            messages = messages.map { if (it.id == parentId) it.copy(selectedChildId = u.id) else it } + u + a,
+            rootMessageId = rootMessageId ?: u.id,
+            updatedAt = System.currentTimeMillis(),
+        )
+    }
 }

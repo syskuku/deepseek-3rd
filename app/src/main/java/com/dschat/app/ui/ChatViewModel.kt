@@ -252,32 +252,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
         val now = System.currentTimeMillis()
         var session = (_active.value ?: Session(SessionStore.newId(), "", now, now, emptyList())).normalized()
-        val visible = session.visibleMessages()
-        val parentId = visible.lastOrNull()?.id
 
         val files = drafts.map { d ->
             FileMeta(d.id, d.name, d.size, d.isImage, d.mimeType, d.localPath, null)
         }
         val userMsg = ChatMessage(
             SessionStore.newId(), "user", now, content = content, files = files,
-            parentId = parentId,
         )
         val assistant = ChatMessage(
             SessionStore.newId(), "assistant", now + 1,
             status = "streaming", thinking = _thinking.value, search = _search.value,
-            parentId = userMsg.id,
         )
-        session = session.copy(
-            messages = session.messages.map {
-                if (it.id == parentId) it.copy(selectedChildId = userMsg.id) else it
-            } + userMsg + assistant,
-            rootMessageId = session.rootMessageId ?: userMsg.id,
-            updatedAt = now,
-        )
+        // 统一走 appendRound：正确链接 parentId / selectedChildId，避免回复不可见或错误分叉
+        session = session.appendRound(userMsg, assistant)
         _active.value = session
         _drafts.value = emptyList()
         upsertMeta(session)
-        startStream(session, userMsg, assistant, prefix = null, apiKey = apiKey)
+        // 取链接后的副本进入流式状态机，避免回写时覆盖树字段
+        val linkedUser = session.messages.first { it.id == userMsg.id }
+        val linkedAssistant = session.messages.first { it.id == assistant.id }
+        startStream(session, linkedUser, linkedAssistant, prefix = null, apiKey = apiKey)
     }
 
     /** 重新生成：在同一提问下新建兄弟分支（官方 appendBranch 语义） */
@@ -407,7 +401,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
             fun pushReply() {
                 updateActive { s ->
-                    if (s.id != sessionId) s else s.replaceMessage(reply)
+                    if (s.id != sessionId) s
+                    else s.copy(
+                        // 保留树字段：流式回写只更新内容，绝不覆盖 parentId / selectedChildId
+                        messages = s.messages.map {
+                            if (it.id == reply.id) reply.copy(parentId = it.parentId, selectedChildId = it.selectedChildId) else it
+                        },
+                        updatedAt = System.currentTimeMillis(),
+                    )
                 }
             }
 
