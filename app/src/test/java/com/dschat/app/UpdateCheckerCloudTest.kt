@@ -16,7 +16,7 @@ class UpdateCheckerCloudTest {
             null
         }
         assumeTrue("network unavailable", info != null)
-        assertTrue("should prefer cloud CDN url", info!!.apkUrl.contains("kodo.imikufans.com"))
+        assertTrue("should prefer cloud (Worker/kodo) url", info!!.apkUrl.contains("imikufans.com"))
         assertTrue("version present", info.version.isNotEmpty())
     }
 }

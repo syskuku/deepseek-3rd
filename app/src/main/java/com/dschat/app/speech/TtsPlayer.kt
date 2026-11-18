@@ -57,16 +57,23 @@ class TtsPlayer(private val scope: CoroutineScope) {
             track = t
             t.play()
             var started = false
+            // PCM 16-bit 小端：网络分块可能为奇数字节，跨块错位会产生爆音。
+            // 用 carry 保存不足一个采样的尾字节，保证每次写入都是偶数字节（采样对齐）。
+            var carry = ByteArray(0)
             try {
                 SpeechApi.synthesize(apiKey, text, voice).collect { chunk ->
+                    val data = if (carry.isEmpty()) chunk else carry + chunk
+                    val even = data.size - (data.size % 2)
+                    carry = if (even < data.size) data.copyOfRange(even, data.size) else ByteArray(0)
+                    if (even <= 0) return@collect
                     if (!started) {
                         started = true
                         status = Status.PLAYING
                         onState?.invoke()
                     }
                     var off = 0
-                    while (off < chunk.size) {
-                        val written = t.write(chunk, off, chunk.size - off)
+                    while (off < even) {
+                        val written = t.write(data, off, even - off)
                         if (written <= 0) break
                         off += written
                     }
