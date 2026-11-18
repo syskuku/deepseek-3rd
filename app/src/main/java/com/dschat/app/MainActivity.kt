@@ -21,6 +21,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.dschat.app.ui.ApiKeyScreen
 import com.dschat.app.ui.ChatScreen
 import com.dschat.app.ui.ChatViewModel
+import com.dschat.app.ui.ImportOnboardingScreen
 import com.dschat.app.ui.SettingsScreen
 import com.dschat.app.ui.UpdateDialog
 import com.dschat.app.ui.theme.DeepSeekTheme
@@ -39,6 +40,8 @@ class MainActivity : ComponentActivity() {
             val theme by vm.theme.collectAsState()
             val hasKey by vm.hasApiKey.collectAsState()
             var showSettings by remember { mutableStateOf(false) }
+            val settings = (application as DeepSeekApp).settings
+            var showOnboarding by remember { mutableStateOf(hasKey && !settings.onboardingDone) }
             val snackbar = remember { SnackbarHostState() }
 
             LaunchedEffect(Unit) {
@@ -59,7 +62,17 @@ class MainActivity : ComponentActivity() {
                     Box(modifier = Modifier.fillMaxSize().padding(padding)) {
                         when {
                             !hasKey -> ApiKeyScreen(
-                                onVerified = { key -> vm.verifyAndSaveApiKey(key) },
+                                onVerified = { key ->
+                                    vm.verifyAndSaveApiKey(key)
+                                    if (!settings.onboardingDone) showOnboarding = true
+                                },
+                            )
+                            showOnboarding -> ImportOnboardingScreen(
+                                onImport = { link -> vm.importFromUrl(link) },
+                                onDone = {
+                                    settings.onboardingDone = true
+                                    showOnboarding = false
+                                },
                             )
                             showSettings -> SettingsScreen(vm, onBack = { showSettings = false })
                             else -> ChatScreen(vm, onOpenSettings = { showSettings = true })

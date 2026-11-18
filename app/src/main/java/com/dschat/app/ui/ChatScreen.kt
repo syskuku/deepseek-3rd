@@ -5,6 +5,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,14 +29,17 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -55,6 +60,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -134,7 +140,7 @@ private fun DraftRow(drafts: List<DraftAttachment>, fileOf: (String) -> File, on
     }
 }
 
-/** 输入区（原版 ChatInput）：附件条 + 文本 + 功能行 */
+/** 输入区：附件条 + 文本/按住说话 + 功能行（附件加号在发送键左侧） */
 @Composable
 fun ChatInputBar(
     streaming: Boolean,
@@ -148,10 +154,18 @@ fun ChatInputBar(
     onRemoveDraft: (String) -> Unit,
     onSend: (String) -> Unit,
     onStop: () -> Unit,
+    onVoiceStart: () -> Boolean,
+    onVoiceEnd: (cancel: Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val ds = LocalDsColors.current
     var text by remember { mutableStateOf("") }
+    // 语音模式：空输入时发送键显示为麦克风，点击进入「按住说话」
+    var voiceMode by remember { mutableStateOf(false) }
+    var holding by remember { mutableStateOf(false) }
+
+    // 有文字时退出语音模式
+    LaunchedEffect(text) { if (text.isNotBlank()) voiceMode = false }
 
     Column(
         modifier = modifier
@@ -160,32 +174,74 @@ fun ChatInputBar(
             .border(1.dp, ds.borderL2, RoundedCornerShape(24.dp)),
     ) {
         if (drafts.isNotEmpty()) DraftRow(drafts, fileOf, onRemoveDraft)
-        BasicTextField(
-            value = text,
-            onValueChange = { text = it },
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 48.dp, max = 180.dp)
-                .padding(start = 16.dp, end = 12.dp, top = 12.dp),
-            textStyle = TextStyle(fontSize = 16.sp, lineHeight = 24.sp, color = ds.labelPrimary),
-            cursorBrush = SolidColor(ds.brandText),
-            maxLines = 8,
-            decorationBox = { inner ->
-                Box {
-                    if (text.isEmpty()) Text("请输入消息", fontSize = 16.sp, lineHeight = 24.sp, color = ds.labelCaption)
-                    inner()
-                }
-            },
-        )
-        Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onPickFiles, enabled = !streaming, modifier = Modifier.size(34.dp)) {
-                Icon(Icons.Filled.AttachFile, "上传文件", tint = if (streaming) ds.labelDimmed else ds.labelSecondary, modifier = Modifier.size(20.dp))
+
+        if (voiceMode && text.isBlank()) {
+            // 按住说话条
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .padding(start = 16.dp, end = 12.dp, top = 12.dp)
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown()
+                            down.consume()
+                            if (onVoiceStart()) {
+                                holding = true
+                                var cancelled = false
+                                val startY = down.position.y
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull()
+                                    if (change != null) {
+                                        if (startY - change.position.y > 120) cancelled = true
+                                        change.consume()
+                                    }
+                                } while (event.changes.any { it.pressed })
+                                holding = false
+                                onVoiceEnd(cancelled)
+                            }
+                        }
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    if (holding) "松手发送，上滑取消" else "按住说话",
+                    fontSize = 16.sp,
+                    color = if (holding) ds.brand else ds.labelPrimary,
+                    fontWeight = if (holding) FontWeight.Medium else FontWeight.Normal,
+                )
             }
-            Spacer(Modifier.width(4.dp))
+        } else {
+            BasicTextField(
+                value = text,
+                onValueChange = { text = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp, max = 180.dp)
+                    .padding(start = 16.dp, end = 12.dp, top = 12.dp),
+                textStyle = TextStyle(fontSize = 16.sp, lineHeight = 24.sp, color = ds.labelPrimary),
+                cursorBrush = SolidColor(ds.brandText),
+                maxLines = 8,
+                decorationBox = { inner ->
+                    Box {
+                        if (text.isEmpty()) Text("发消息或按住说话", fontSize = 16.sp, lineHeight = 24.sp, color = ds.labelCaption)
+                        inner()
+                    }
+                },
+            )
+        }
+
+        Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             ToggleChip("深度思考", Icons.Filled.Psychology, thinking, onToggleThinking)
             Spacer(Modifier.width(10.dp))
             ToggleChip("智能搜索", Icons.Filled.Search, search, onToggleSearch)
             Spacer(Modifier.weight(1f))
+            // 附件加号：移到发送键左侧
+            IconButton(onClick = onPickFiles, enabled = !streaming, modifier = Modifier.size(34.dp)) {
+                Icon(Icons.Filled.Add, "上传文件", tint = if (streaming) ds.labelDimmed else ds.labelSecondary, modifier = Modifier.size(22.dp))
+            }
+            Spacer(Modifier.width(4.dp))
             if (streaming) {
                 Box(
                     modifier = Modifier.size(34.dp).background(ds.brand, CircleShape).clickable(onClick = onStop),
@@ -193,16 +249,23 @@ fun ChatInputBar(
                 ) {
                     Icon(Icons.Filled.Stop, "停止生成", tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.size(18.dp))
                 }
-            } else {
-                val enabled = text.isNotBlank() || drafts.isNotEmpty()
+            } else if (text.isNotBlank() || drafts.isNotEmpty()) {
                 Box(
-                    modifier = Modifier
-                        .size(34.dp)
-                        .background(if (enabled) ds.brand else ds.brand.copy(alpha = 0.4f), CircleShape)
-                        .clickable(enabled = enabled) { onSend(text); text = "" },
+                    modifier = Modifier.size(34.dp).background(ds.brand, CircleShape)
+                        .clickable { onSend(text); text = "" },
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, "发送", tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.size(16.dp))
+                }
+            } else if (voiceMode) {
+                // 语音模式下显示键盘按钮，点击回到文本输入
+                IconButton(onClick = { voiceMode = false }, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Filled.Keyboard, "键盘输入", tint = ds.labelSecondary, modifier = Modifier.size(22.dp))
+                }
+            } else {
+                // 空输入：发送键显示为麦克风，点击进入按住说话
+                IconButton(onClick = { voiceMode = true }, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Filled.Mic, "语音输入", tint = ds.labelSecondary, modifier = Modifier.size(22.dp))
                 }
             }
         }
@@ -223,24 +286,49 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
+    val context = androidx.compose.ui.platform.LocalContext.current
 
     val session = active
     val messages = remember(session) { session?.visibleMessages() ?: emptyList() }
     val streaming = streamingId != null && streamingId == session?.id
+    val autoRead by vm.autoRead.collectAsState()
+    val readingId by vm.readingId.collectAsState()
 
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) vm.addDrafts(uris)
     }
 
-    // 是否处于底部：决定流式输出时是否自动跟随
+    // 录音
+    val recorder = remember { com.dschat.app.speech.VoiceRecorder() }
+    var voiceError by remember { mutableStateOf<String?>(null) }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) voiceError = "需要麦克风权限才能语音输入"
+    }
+
+    // 编辑用户消息
+    var editing by remember { mutableStateOf<com.dschat.app.data.ChatMessage?>(null) }
+
+    // 底部锁定：默认锁定；仅用户亲自上滑才解锁；发送新消息重新锁定
+    var bottomLocked by remember { mutableStateOf(true) }
     val isAtBottom by remember { derivedStateOf { !listState.canScrollForward } }
     val lastTick = messages.lastOrNull()?.let { it.blocks.size * 100000 + it.replyText.length } ?: 0
 
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex, Int.MAX_VALUE)
+    // 用户上滑（离开底部）→ 解锁；回到底部不自动重锁（需发送或点箭头）
+    LaunchedEffect(isAtBottom) {
+        if (!isAtBottom) bottomLocked = false
     }
+    // 发送新消息（条数增加）→ 重新锁定并滚到底
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) {
+            bottomLocked = true
+            listState.animateScrollToItem(messages.lastIndex, Int.MAX_VALUE)
+        }
+    }
+    // 流式增长：仅在锁定时跟随
     LaunchedEffect(lastTick) {
-        if (messages.isNotEmpty() && isAtBottom) listState.scrollToItem(messages.lastIndex, Int.MAX_VALUE)
+        if (messages.isNotEmpty() && bottomLocked) {
+            listState.scrollToItem(messages.lastIndex, Int.MAX_VALUE)
+        }
     }
 
     ModalNavigationDrawer(
@@ -273,6 +361,13 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
                 )
+                IconButton(onClick = { vm.setAutoRead(!autoRead) }) {
+                    Icon(
+                        if (autoRead) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff,
+                        if (autoRead) "关闭自动朗读" else "开启自动朗读",
+                        tint = if (autoRead) ds.brand else ds.labelPrimary,
+                    )
+                }
                 IconButton(onClick = { vm.newChat() }) {
                     Icon(Icons.Filled.Add, "开启新对话", tint = ds.labelPrimary)
                 }
@@ -296,17 +391,20 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                                     session = session!!,
                                     fileOf = vm::attachmentFile,
                                     onSwitchVersion = { vm.switchVersion(message.id, it) },
+                                    onEdit = { editing = message },
                                 )
                             } else {
                                 AssistantMessageView(
                                     message = message,
                                     session = session!!,
                                     isLast = index == messages.lastIndex,
+                                    reading = readingId == message.id,
                                     onRetry = vm::retryLast,
                                     onContinue = vm::continueLast,
                                     onRegenerate = { vm.regenerate(message.id) },
                                     onSwitchVersion = { vm.switchVersion(message.id, it) },
                                     onCopied = { vm.toast("已复制") },
+                                    onReadAloud = { vm.toggleReadAloud(message) },
                                 )
                             }
                         }
@@ -320,6 +418,7 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                         androidx.compose.material3.Surface(
                             shape = CircleShape, color = ds.layer3, shadowElevation = 4.dp,
                             modifier = Modifier.size(36.dp).clickable {
+                                bottomLocked = true
                                 scope.launch { listState.animateScrollToItem(messages.lastIndex, Int.MAX_VALUE) }
                             },
                         ) {
@@ -346,6 +445,25 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                     onRemoveDraft = vm::removeDraft,
                     onSend = vm::send,
                     onStop = vm::stop,
+                    onVoiceStart = {
+                        val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                            context, android.Manifest.permission.RECORD_AUDIO,
+                        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                        if (!granted) {
+                            micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                            false
+                        } else {
+                            recorder.start()
+                        }
+                    },
+                    onVoiceEnd = { cancel ->
+                        if (cancel) {
+                            recorder.cancel()
+                        } else {
+                            val wav = recorder.stop()
+                            if (wav != null) vm.sendVoice(wav) else vm.toast("未识别到语音内容")
+                        }
+                    },
                 )
                 Text(
                     "内容由 AI 生成，请仔细甄别",
@@ -355,5 +473,49 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                 )
             }
         }
+    }
+
+    // 编辑用户消息弹窗：修改后 fork 新分支重答
+    editing?.let { msg ->
+        var editText by remember(msg.id) { mutableStateOf(msg.content) }
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { editing = null },
+            title = { Text("修改输入") },
+            text = {
+                androidx.compose.material3.OutlinedTextField(
+                    value = editText,
+                    onValueChange = { editText = it },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 100.dp),
+                    minLines = 3,
+                    maxLines = 8,
+                )
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    enabled = editText.isNotBlank(),
+                    onClick = {
+                        val id = msg.id
+                        val content = editText
+                        editing = null
+                        vm.editUserMessage(id, content)
+                    },
+                ) { Text("发送") }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { editing = null }) { Text("取消") }
+            },
+        )
+    }
+
+    // 语音权限/错误提示
+    voiceError?.let { err ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { voiceError = null },
+            title = { Text("语音输入") },
+            text = { Text(err) },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = { voiceError = null }) { Text("知道了") }
+            },
+        )
     }
 }

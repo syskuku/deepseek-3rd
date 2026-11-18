@@ -138,6 +138,14 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                     }
                 }
             }
+            // 自动朗读
+            val autoRead by vm.autoRead.collectAsState()
+            SettingRow(title = "自动朗读", subtitle = "开启后每次回复自动发声") {
+                androidx.compose.material3.Switch(
+                    checked = autoRead,
+                    onCheckedChange = { vm.setAutoRead(it) },
+                )
+            }
             // API Key
             SettingRow(
                 title = "API Key",
@@ -183,11 +191,18 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             }
 
             SectionTitle("关于与开源许可")
-            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.2.2 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.3.0 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
             SettingRow(
                 title = "检查更新",
-                subtitle = "从 GitHub Releases 获取最新版本",
+                subtitle = "优先国内云，GitHub 兜底",
                 onClick = { vm.checkUpdate(manual = true) },
+            ) {
+                Icon(Icons.Filled.ChevronRight, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
+            }
+            SettingRow(
+                title = "贡献者：Syskuku",
+                subtitle = "www.imikufans.com",
+                onClick = { uriHandler.openUri("https://www.imikufans.com") },
             ) {
                 Icon(Icons.Filled.ChevronRight, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
             }
@@ -254,13 +269,9 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                         fontSize = 13.sp, lineHeight = 19.sp, color = ds.labelSecondary,
                     )
                     Spacer(Modifier.height(12.dp))
-                    OutlinedTextField(
+                    LinkPasteField(
                         value = linkUrl,
-                        onValueChange = { linkUrl = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("https://...zip") },
-                        minLines = 2,
-                        maxLines = 4,
+                        onChange = { linkUrl = it },
                     )
                 }
             },

@@ -30,6 +30,7 @@ import com.dschat.app.net.StreamEvent
 import com.dschat.app.net.UpdateChecker
 import com.dschat.app.net.classifyError
 import com.dschat.app.net.isRetryable
+import com.dschat.app.speech.TtsPlayer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -96,6 +97,27 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _busy = MutableStateFlow(false)
     val busy: StateFlow<Boolean> = _busy
+
+    // ---- 朗读 ----
+    val tts = TtsPlayer(viewModelScope)
+    private val _readingId = MutableStateFlow<String?>(null)
+    val readingId: StateFlow<String?> = _readingId
+    private val _autoRead = MutableStateFlow(settings.autoRead)
+    val autoRead: StateFlow<Boolean> = _autoRead
+
+    init {
+        tts.onState = { _readingId.value = tts.messageId }
+    }
+
+    fun setAutoRead(value: Boolean) { _autoRead.value = value; settings.autoRead = value }
+
+    /** 点击回复喇叭：朗读/停止 */
+    fun toggleReadAloud(message: ChatMessage) {
+        val key = settings.apiKey ?: return
+        tts.toggle(key, message.id, message.replyText, settings.ttsVoice) { err -> toast(err) }
+    }
+
+    fun stopReadAloud() = tts.stop()
 
     private var streamJob: Job? = null
     private var lastSaveAt = 0L
@@ -253,6 +275,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if ((content.isEmpty() && drafts.isEmpty()) || _streamingSessionId.value != null) return
         val apiKey = settings.apiKey
         if (apiKey == null) { toast("请先设置 API Key"); return }
+        stopReadAloud()
 
         val now = System.currentTimeMillis()
         var session = (_active.value ?: Session(SessionStore.newId(), "", now, now, emptyList())).normalized()
@@ -276,6 +299,58 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val linkedUser = session.messages.first { it.id == userMsg.id }
         val linkedAssistant = session.messages.first { it.id == assistant.id }
         startStream(session, linkedUser, linkedAssistant, prefix = null, apiKey = apiKey)
+    }
+
+    /** 语音识别后直接发送（不经文本框） */
+    fun sendVoice(wav: ByteArray) {
+        val apiKey = settings.apiKey ?: return
+        viewModelScope.launch {
+            try {
+                val text = com.dschat.app.net.SpeechApi.transcribe(apiKey, wav).trim()
+                if (text.isEmpty()) { toast("未识别到语音内容"); return@launch }
+                send(text)
+            } catch (e: Exception) {
+                toast("语音识别失败：${e.message ?: "请稍后再试"}")
+            }
+        }
+    }
+
+    /** 编辑用户消息：fork 成新兄弟分支并重新回答（官方 edit 语义） */
+    fun editUserMessage(messageId: String, newContent: String) {
+        val session = _active.value?.normalized() ?: return
+        if (_streamingSessionId.value != null) return
+        val apiKey = settings.apiKey ?: return
+        val original = session.messages.find { it.id == messageId } ?: return
+        if (original.role != "user") return
+        val content = newContent.trim()
+        if (content.isEmpty()) return
+        stopReadAloud()
+
+        val now = System.currentTimeMillis()
+        val newUser = original.copy(
+            id = SessionStore.newId(), createdAt = now, content = content,
+            selectedChildId = null,
+        )
+        val assistant = ChatMessage(
+            SessionStore.newId(), "assistant", now + 1,
+            status = "streaming", thinking = _thinking.value, search = _search.value,
+        )
+        // 新提问挂在原提问的父节点下，成为兄弟；父节点选中新提问
+        val parentId = original.parentId
+        var messages = session.messages.map {
+            if (it.id == parentId) it.copy(selectedChildId = newUser.id) else it
+        }
+        val linkedUser = newUser.copy(parentId = parentId, selectedChildId = assistant.id)
+        val linkedAssistant = assistant.copy(parentId = linkedUser.id)
+        messages = messages + linkedUser + linkedAssistant
+        val base = session.copy(
+            messages = messages,
+            rootMessageId = if (parentId == null) linkedUser.id else session.rootMessageId,
+            updatedAt = now,
+        )
+        _active.value = base
+        upsertMeta(base)
+        startStream(base, linkedUser, linkedAssistant, prefix = null, apiKey = apiKey)
     }
 
     /** 重新生成：在同一提问下新建兄弟分支（官方 appendBranch 语义） */
@@ -445,6 +520,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         if (!finished) throw ApiError(ApiErrorKind.INTERRUPTED, "")
                         reply = settle(reply, "done")
                         finished = true
+                        // 自动朗读：回复正常完成且开关开启时朗读正文
+                        if (_autoRead.value && reply.replyText.isNotBlank()) {
+                            val key = settings.apiKey
+                            if (key != null) tts.toggle(key, reply.id, reply.replyText, settings.ttsVoice) { }
+                        }
                     } catch (e: CancellationException) {
                         reply = settle(reply, "stopped")
                         pushReply()

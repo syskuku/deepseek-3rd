@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.StopCircle
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
@@ -154,13 +155,14 @@ fun AttachmentRow(message: ChatMessage, fileOf: (String) -> File) {
     }
 }
 
-/** 用户消息：右对齐气泡 + 附件 + 版本切换 */
+/** 用户消息：右对齐气泡 + 附件 + 版本切换 + 点击编辑 */
 @Composable
 fun UserMessageView(
     message: ChatMessage,
     session: Session,
     fileOf: (String) -> File,
     onSwitchVersion: (String) -> Unit,
+    onEdit: () -> Unit,
 ) {
     val ds = LocalDsColors.current
     Column(
@@ -174,6 +176,7 @@ fun UserMessageView(
                 modifier = Modifier
                     .widthIn(max = 320.dp)
                     .background(ds.bubble, RoundedCornerShape(22.dp))
+                    .clickable(onClick = onEdit)
                     .padding(horizontal = 16.dp, vertical = 10.dp),
             ) {
                 Text(message.content, fontSize = 16.sp, lineHeight = 24.sp, color = ds.labelPrimary)
@@ -325,11 +328,13 @@ fun AssistantMessageView(
     message: ChatMessage,
     session: Session,
     isLast: Boolean,
+    reading: Boolean,
     onRetry: () -> Unit,
     onContinue: () -> Unit,
     onRegenerate: () -> Unit,
     onSwitchVersion: (String) -> Unit,
     onCopied: () -> Unit,
+    onReadAloud: () -> Unit,
 ) {
     val ds = LocalDsColors.current
     val clipboard = LocalClipboardManager.current
@@ -388,6 +393,14 @@ fun AssistantMessageView(
                         onCopied()
                     }, modifier = Modifier.size(28.dp)) {
                         Icon(Icons.Filled.ContentCopy, "复制", tint = ds.labelTertiary, modifier = Modifier.size(16.dp))
+                    }
+                    IconButton(onClick = onReadAloud, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            if (reading) Icons.Filled.StopCircle else Icons.Filled.VolumeUp,
+                            if (reading) "停止朗读" else "朗读",
+                            tint = if (reading) ds.brand else ds.labelTertiary,
+                            modifier = Modifier.size(16.dp),
+                        )
                     }
                 }
                 if (canRegenerate) {

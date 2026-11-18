@@ -65,6 +65,18 @@ fun UpdateDialog(vm: ChatViewModel) {
                     Spacer(Modifier.height(10.dp))
                     Text(error!!, fontSize = 12.sp, lineHeight = 17.sp, color = ds.error)
                 }
+                Spacer(Modifier.height(8.dp))
+                // 官网下载：默认浏览器跳转 ds.imikufans.com（绑定 CF Worker）
+                TextButton(onClick = {
+                    runCatching {
+                        context.startActivity(
+                            android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://ds.imikufans.com"))
+                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }
+                }) {
+                    Text("官网下载", color = ds.brandText, fontSize = 13.sp)
+                }
             }
         },
         confirmButton = {
