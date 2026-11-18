@@ -13,6 +13,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import java.text.SimpleDateFormat
@@ -20,7 +21,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 class ArchiveException(message: String) : Exception(message)
@@ -76,46 +76,54 @@ object HistoryArchive {
      */
     fun import(openStream: () -> InputStream, saveImage: (String, ByteArray) -> String): List<Session> {
         val sessionJsons = LinkedHashMap<String, ByteArray>()
-        var indexBytes: ByteArray? = null
         val referencedImages = HashSet<String>()
+        val imagePaths = HashMap<String, String>()
+        var index: JsonArray? = null
 
-        // 第一遍：校验 manifest、收集会话 JSON 与索引、登记被引用的图片条目
-        openStream().use { raw ->
-            ZipInputStream(raw.buffered()).use { zis ->
-                var entry = zis.nextEntry
-                var first = true
-                while (entry != null) {
-                    if (!entry.isDirectory) {
-                        val name = entry.name.nfc()
-                        if (first) {
-                            if (name != "manifest.json") throw ArchiveException("无法识别该文件，请选择 DeepSeek 导出的历史对话 ZIP 文件")
-                            val manifest = runCatching { json.parseToJsonElement(zis.readBytes().decodeToString()).jsonObject }
+        // 官方导出的图片为 STORED + 数据描述符(EXT)写法：ZipInputStream 在 JVM 直接抛
+        // "only DEFLATED entries can have EXT descriptor"，在 Android 则静默读出 0 字节
+        // （导致发送时服务端报 'file' is empty）。改用 ZipFile 读中央目录，先落临时文件。
+        val temp = File.createTempFile("ds_import", ".zip")
+        try {
+            openStream().use { input -> temp.outputStream().use { input.copyTo(it) } }
+            java.util.zip.ZipFile(temp).use { zip ->
+                fun read(name: String): ByteArray? {
+                    val e = zip.getEntry(name) ?: return null
+                    return zip.getInputStream(e).use { it.readBytes() }
+                }
+
+                val manifestBytes = read("manifest.json")
+                    ?: throw ArchiveException("无法识别该文件，请选择 DeepSeek 导出的历史对话 ZIP 文件")
+                val manifest = runCatching { json.parseToJsonElement(manifestBytes.decodeToString()).jsonObject }
+                    .getOrElse { throw ArchiveException("文件不是有效的 JSON") }
+                val version = manifest.int("export_format_version")
+                when {
+                    version == null -> throw ArchiveException("文件版本无效，无法导入")
+                    version > VERSION -> throw ArchiveException("文件版本过新，请升级后再导入")
+                    version != VERSION -> throw ArchiveException("文件版本无效，无法导入")
+                }
+
+                val entries = zip.entries()
+                while (entries.hasMoreElements()) {
+                    val e = entries.nextElement()
+                    if (e.isDirectory) continue
+                    val name = e.name.nfc()
+                    when {
+                        name == "chat_session_index.json" ->
+                            index = runCatching { json.parseToJsonElement(zip.getInputStream(e).use { it.readBytes() }.decodeToString()).jsonArray }
                                 .getOrElse { throw ArchiveException("文件不是有效的 JSON") }
-                            val version = manifest.int("export_format_version")
-                            when {
-                                version == null -> throw ArchiveException("文件版本无效，无法导入")
-                                version > VERSION -> throw ArchiveException("文件版本过新，请升级后再导入")
-                                version != VERSION -> throw ArchiveException("文件版本无效，无法导入")
-                            }
-                            first = false
-                        } else when {
-                            name == "chat_session_index.json" -> indexBytes = zis.readBytes()
-                            name.matches(Regex("chat_sessions/[^/]+\\.json")) -> {
-                                val bytes = zis.readBytes()
-                                sessionJsons[name] = bytes
-                                // 登记 FILE 片段引用的图片路径
-                                runCatching {
-                                    val obj = json.parseToJsonElement(bytes.decodeToString()).jsonObject
-                                    obj.arr("messages")?.forEach { m ->
-                                        (m as? JsonObject)?.arr("fragments")?.forEach { f ->
-                                            val fo = f as? JsonObject ?: return@forEach
-                                            if (fo.str("type") == "FILE") {
-                                                fo.arr("files")?.forEach { file ->
-                                                    val fo2 = file as? JsonObject ?: return@forEach
-                                                    if (fo2.bool("is_image")) {
-                                                        fo2.str("export_path")?.let { referencedImages += it.nfc() }
-                                                    }
-                                                }
+                        name.matches(Regex("chat_sessions/[^/]+\\.json")) -> {
+                            val bytes = zip.getInputStream(e).use { it.readBytes() }
+                            sessionJsons[name] = bytes
+                            runCatching {
+                                val obj = json.parseToJsonElement(bytes.decodeToString()).jsonObject
+                                obj.arr("messages")?.forEach { m ->
+                                    (m as? JsonObject)?.arr("fragments")?.forEach { f ->
+                                        val fo = f as? JsonObject ?: return@forEach
+                                        if (fo.str("type") == "FILE") {
+                                            fo.arr("files")?.forEach { file ->
+                                                val fo2 = file as? JsonObject ?: return@forEach
+                                                if (fo2.bool("is_image")) fo2.str("export_path")?.let { referencedImages += it.nfc() }
                                             }
                                         }
                                     }
@@ -123,39 +131,25 @@ object HistoryArchive {
                             }
                         }
                     }
-                    zis.closeEntry()
-                    entry = zis.nextEntry
+                }
+
+                // 提取被引用的图片原件（ZipFile 正确处理 STORED+EXT，字节完整）
+                for (path in referencedImages) {
+                    val bytes = read(path) ?: continue
+                    if (bytes.isEmpty()) continue
+                    imagePaths[path] = saveImage(path, bytes)
                 }
             }
+        } finally {
+            temp.delete()
         }
         if (sessionJsons.isEmpty()) throw ArchiveException("文件内容不完整，无法导入")
-        val index = runCatching { json.parseToJsonElement((indexBytes ?: throw ArchiveException("文件内容不完整，无法导入")).decodeToString()).jsonArray }
-            .getOrElse { throw ArchiveException("文件不是有效的 JSON") }
-
-        // 第二遍：提取被引用的图片原件
-        val imagePaths = HashMap<String, String>()
-        if (referencedImages.isNotEmpty()) {
-            openStream().use { raw ->
-                ZipInputStream(raw.buffered()).use { zis ->
-                    var entry = zis.nextEntry
-                    while (entry != null) {
-                        if (!entry.isDirectory) {
-                            val name = entry.name.nfc()
-                            if (name in referencedImages) {
-                                imagePaths[name] = saveImage(name, zis.readBytes())
-                            }
-                        }
-                        zis.closeEntry()
-                        entry = zis.nextEntry
-                    }
-                }
-            }
-        }
+        val indexArr = index ?: throw ArchiveException("文件内容不完整，无法导入")
 
         // 解析会话（索引与会话一一对应）
         val sessions = ArrayList<Session>()
         val seen = HashSet<String>()
-        for (item in index) {
+        for (item in indexArr) {
             val meta = item as? JsonObject ?: throw ArchiveException("文件内容不完整，无法导入")
             val id = meta.str("id") ?: throw ArchiveException("文件内容不完整，无法导入")
             if (!seen.add(id)) throw ArchiveException("文件内容不完整，无法导入")

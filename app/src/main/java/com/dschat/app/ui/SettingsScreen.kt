@@ -24,11 +24,13 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -66,6 +68,8 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
     var showLicense by remember { mutableStateOf(false) }
     var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
     var showDeleteAll by remember { mutableStateOf(false) }
+    var showLinkImport by remember { mutableStateOf(false) }
+    var linkUrl by remember { mutableStateOf("") }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) pendingImportUri = uri
@@ -156,6 +160,13 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                 Icon(Icons.Filled.Upload, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
             }
             SettingRow(
+                title = "从链接导入",
+                subtitle = "粘贴 DeepSeek 官方导出链接，自动下载并导入（同样覆盖本地对话）。",
+                onClick = { linkUrl = ""; showLinkImport = true },
+            ) {
+                Icon(Icons.Filled.Link, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
+            }
+            SettingRow(
                 title = "导出所有历史对话",
                 subtitle = "包含所有历史对话；不包含 API Key。",
                 onClick = { exportLauncher.launch(HistoryArchive.exportFileName()) },
@@ -172,7 +183,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             }
 
             SectionTitle("关于与开源许可")
-            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.2.1 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.2.2 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
             SettingRow(
                 title = "检查更新",
                 subtitle = "从 GitHub Releases 获取最新版本",
@@ -228,6 +239,49 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                 }) { Text("确认导入") }
             },
             dismissButton = { TextButton(onClick = { pendingImportUri = null }) { Text("取消") } },
+        )
+    }
+
+    // 从链接导入
+    if (showLinkImport) {
+        AlertDialog(
+            onDismissRequest = { showLinkImport = false },
+            title = { Text("从链接导入历史对话") },
+            text = {
+                Column {
+                    Text(
+                        "粘贴 DeepSeek 官方导出的下载链接，将自动下载并导入。导入会覆盖当前所有对话记录。",
+                        fontSize = 13.sp, lineHeight = 19.sp, color = ds.labelSecondary,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = linkUrl,
+                        onValueChange = { linkUrl = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("https://...zip") },
+                        minLines = 2,
+                        maxLines = 4,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = linkUrl.isNotBlank(),
+                    onClick = {
+                        val u = linkUrl.trim()
+                        showLinkImport = false
+                        scope.launch {
+                            try {
+                                val count = vm.importFromUrl(u)
+                                vm.toast(if (count == 1) "已导入 1 个对话" else "已导入 $count 个对话")
+                            } catch (e: Exception) {
+                                vm.toast(e.message ?: "导入失败，请检查链接是否有效")
+                            }
+                        }
+                    },
+                ) { Text("下载并导入") }
+            },
+            dismissButton = { TextButton(onClick = { showLinkImport = false }) { Text("取消") } },
         )
     }
 

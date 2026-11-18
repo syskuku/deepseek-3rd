@@ -45,9 +45,13 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.TimeUnit
 
 /** 输入框待发送附件 */
 data class DraftAttachment(
@@ -607,6 +611,32 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             sessions.size
         } finally {
             _busy.value = false
+        }
+    }
+
+    /** 从官方导出链接下载 ZIP 并导入（华为云 OBS 等签名直链） */
+    suspend fun importFromUrl(url: String): Int = withContext(Dispatchers.IO) {
+        val trimmed = url.trim()
+        if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+            throw IllegalArgumentException("链接无效，请粘贴完整的导出链接")
+        }
+        val context = getApplication<DeepSeekApp>()
+        val temp = File.createTempFile("ds_link", ".zip", context.cacheDir)
+        try {
+            val client = OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(180, TimeUnit.SECONDS)
+                .build()
+            val request = Request.Builder().url(trimmed).get().build()
+            client.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) throw IOException("下载失败：HTTP ${resp.code}")
+                temp.outputStream().use { out ->
+                    resp.body?.byteStream()?.copyTo(out) ?: throw IOException("下载内容为空")
+                }
+            }
+            importArchive { temp.inputStream() }
+        } finally {
+            temp.delete()
         }
     }
 

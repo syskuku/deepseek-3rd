@@ -20,6 +20,8 @@ import java.util.concurrent.TimeUnit
  */
 object UpdateChecker {
     private const val API = "https://api.github.com/repos/syskuku/deepseek-3rd/releases/latest"
+    /** 国内对象存储更新清单（七牛 CDN），检查更新时优先于 GitHub */
+    private const val CLOUD_MANIFEST = "https://kodo.imikufans.com/ds.imikufans.com/ds3rd/update.json"
 
     data class UpdateInfo(
         val tag: String,
@@ -35,22 +37,47 @@ object UpdateChecker {
         .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    /** 拉取最新 Release；无资产或解析失败返回 null */
+    /** 拉取最新版本：优先国内对象存储 manifest，失败再回退 GitHub Releases */
     suspend fun fetchLatest(): UpdateInfo? = withContext(Dispatchers.IO) {
+        fetchCloud() ?: fetchGitHub()
+    }
+
+    /** 国内云 manifest（七牛 CDN），对境内用户更友好 */
+    private fun fetchCloud(): UpdateInfo? = try {
+        val request = Request.Builder().url(CLOUD_MANIFEST).get().build()
+        val quick = client.newBuilder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS).build()
+        quick.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val obj = json.parseToJsonElement(resp.body?.string() ?: "").jsonObject
+            val version = obj["version"]?.jsonPrimitive?.content ?: return null
+            val url = obj["url"]?.jsonPrimitive?.content ?: return null
+            UpdateInfo(
+                tag = "v$version",
+                version = version,
+                notes = obj["notes"]?.jsonPrimitive?.content ?: "",
+                apkUrl = url,
+                apkSize = obj["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
+            )
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun fetchGitHub(): UpdateInfo? {
         val request = Request.Builder().url(API).header("Accept", "application/vnd.github+json").get().build()
         client.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
             val obj = json.parseToJsonElement(resp.body?.string() ?: "").jsonObject
-            val tag = obj["tag_name"]?.jsonPrimitive?.content ?: return@withContext null
+            val tag = obj["tag_name"]?.jsonPrimitive?.content ?: return null
             val notes = obj["body"]?.jsonPrimitive?.content ?: ""
             val asset = obj["assets"]?.jsonArray?.map { it.jsonObject }
                 ?.firstOrNull { it["name"]?.jsonPrimitive?.content?.endsWith(".apk") == true }
-                ?: return@withContext null
-            UpdateInfo(
+                ?: return null
+            return UpdateInfo(
                 tag = tag,
                 version = tag.removePrefix("v"),
                 notes = notes,
-                apkUrl = asset["browser_download_url"]?.jsonPrimitive?.content ?: return@withContext null,
+                apkUrl = asset["browser_download_url"]?.jsonPrimitive?.content ?: return null,
                 apkSize = asset["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
             )
         }
@@ -72,7 +99,12 @@ object UpdateChecker {
     /** 下载 APK 到 cacheDir/update.apk，直连失败尝试镜像；onProgress 0..1 */
     suspend fun download(context: Context, url: String, onProgress: (Float) -> Unit): File =
         withContext(Dispatchers.IO) {
-            val mirrors = listOf(url, "https://gh-proxy.com/$url", "https://ghfast.top/$url")
+            // 云直链境内可达无需镜像；GitHub 直链失败时尝试镜像代理
+            val mirrors = if (url.contains("github.com")) {
+                listOf(url, "https://gh-proxy.com/$url", "https://ghfast.top/$url")
+            } else {
+                listOf(url)
+            }
             var lastError: Exception? = null
             for (mirror in mirrors) {
                 try {
