@@ -20,8 +20,9 @@ import java.util.concurrent.TimeUnit
  */
 object UpdateChecker {
     private const val API = "https://api.github.com/repos/syskuku/deepseek-3rd/releases/latest"
-    /** 国内对象存储更新清单（七牛 CDN），检查更新时优先于 GitHub */
-    private const val CLOUD_MANIFEST = "https://kodo.imikufans.com/ds.imikufans.com/ds3rd/update.json"
+    /** 国内更新清单：优先 Worker 域名（无 CDN 人机验证），失败再试 kodo 与 GitHub */
+    private const val CLOUD_MANIFEST = "https://ds.imikufans.com/update.json"
+    private const val CLOUD_MANIFEST_ALT = "https://kodo.imikufans.com/ds.imikufans.com/ds3rd/update.json"
 
     data class UpdateInfo(
         val tag: String,
@@ -37,6 +38,15 @@ object UpdateChecker {
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
+        // 统一携带标准浏览器 UA/ Accept，避免 CF bot 规则把 okhttp 默认 UA 当机器人拦截
+        .addInterceptor { chain ->
+            val req = chain.request().newBuilder()
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+                .header("Accept", "*/*")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .build()
+            chain.proceed(req)
+        }
         .build()
 
     /** 拉取最新版本：优先国内对象存储 manifest，失败再回退 GitHub Releases */
@@ -44,26 +54,32 @@ object UpdateChecker {
         fetchCloud() ?: fetchGitHub()
     }
 
-    /** 国内云 manifest（七牛 CDN），对境内用户更友好 */
-    private fun fetchCloud(): UpdateInfo? = try {
-        val request = Request.Builder().url(CLOUD_MANIFEST).get().build()
-        val quick = client.newBuilder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS).build()
-        quick.newCall(request).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val obj = json.parseToJsonElement(resp.body?.string() ?: "").jsonObject
-            val version = obj["version"]?.jsonPrimitive?.content ?: return null
-            val url = obj["url"]?.jsonPrimitive?.content ?: return null
-            UpdateInfo(
-                tag = "v$version",
-                version = version,
-                notes = obj["notes"]?.jsonPrimitive?.content ?: "",
-                apkUrl = url,
-                apkSize = obj["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
-                fallbackUrl = "https://github.com/syskuku/deepseek-3rd/releases/download/v$version/DeepSeek-3rd-v$version.apk",
-            )
+    /** 国内云 manifest：先 Worker 域名（无验证），再 kodo；均失败返回 null 走 GitHub */
+    private fun fetchCloud(): UpdateInfo? {
+        for (manifestUrl in listOf(CLOUD_MANIFEST, CLOUD_MANIFEST_ALT)) {
+            val info = try {
+                val request = Request.Builder().url(manifestUrl).get().build()
+                val quick = client.newBuilder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS).build()
+                quick.newCall(request).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    val obj = json.parseToJsonElement(resp.body?.string() ?: "").jsonObject
+                    val version = obj["version"]?.jsonPrimitive?.content ?: return@use null
+                    val url = obj["url"]?.jsonPrimitive?.content ?: return@use null
+                    UpdateInfo(
+                        tag = "v$version",
+                        version = version,
+                        notes = obj["notes"]?.jsonPrimitive?.content ?: "",
+                        apkUrl = url,
+                        apkSize = obj["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
+                        fallbackUrl = "https://github.com/syskuku/deepseek-3rd/releases/download/v$version/DeepSeek-3rd-v$version.apk",
+                    )
+                }
+            } catch (_: Exception) {
+                null
+            }
+            if (info != null) return info
         }
-    } catch (_: Exception) {
-        null
+        return null
     }
 
     private fun fetchGitHub(): UpdateInfo? {
