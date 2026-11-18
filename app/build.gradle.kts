@@ -13,8 +13,8 @@ android {
         applicationId = "com.dschat.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.1.3"
+        versionCode = 4
+        versionName = "0.2.0"
         resourceConfigurations += listOf("zh", "en")
     }
 
@@ -69,4 +69,11 @@ dependencies {
     implementation("io.noties.markwon:ext-strikethrough:4.6.2")
     implementation("io.noties.markwon:ext-tables:4.6.2")
     implementation("io.noties.markwon:linkify:4.6.2")
+    // KaTeX 风格公式（离线渲染）
+    implementation("io.noties.markwon:ext-latex:4.6.2")
+    implementation("ru.noties:jlatexmath-android:0.2.0")
+    // 附件缩略图
+    implementation("io.coil-kt:coil-compose:2.7.0")
+
+    testImplementation("junit:junit:4.13.2")
 }

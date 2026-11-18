@@ -1,6 +1,7 @@
 package com.dschat.app.net
 
 import com.dschat.app.data.ChatMessage
+import com.dschat.app.data.FileMeta
 import com.dschat.app.data.ReplyBlock
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -82,8 +83,30 @@ object RequestBuilder {
         }
     }
 
+    /** 用户消息：有已上传文件时用内容块数组（先文件后文本），否则纯字符串 */
+    private fun userContent(message: ChatMessage): kotlinx.serialization.json.JsonElement {
+        val fileBlocks = message.files.filter { it.serverId != null }.map { f ->
+            buildJsonObject {
+                put("type", if (f.isImage) "image" else "document")
+                putJsonObject("source") { put("type", "file"); put("file_id", f.serverId) }
+            }
+        }
+        return if (fileBlocks.isEmpty()) {
+            kotlinx.serialization.json.JsonPrimitive(message.content)
+        } else {
+            buildJsonArray {
+                fileBlocks.forEach { add(it) }
+                if (message.content.isNotEmpty()) addJsonObject { put("type", "text"); put("text", message.content) }
+            }
+        }
+    }
+
+    /** 请求中是否引用了 Files API 文件（决定 beta 头） */
+    fun hasFileBlocks(history: List<ChatMessage>, question: ChatMessage): Boolean =
+        (history + question).any { m -> m.role == "user" && m.files.any { it.serverId != null } }
+
     /**
-     * @param history 当前消息之前的全部消息
+     * @param history 当前消息之前的全部消息（当前分支）
      * @param question 本轮提问
      * @param prefix 续写时的末尾 assistant（可空）
      */
@@ -98,8 +121,10 @@ object RequestBuilder {
             val user = history[i]
             val reply = history[i + 1]
             if (user.role == "user" && reply.isUsableReply) {
-                if (user.content.isNotBlank()) {
-                    addJsonObject { put("role", "user"); put("content", user.content) }
+                val hasText = user.content.isNotBlank()
+                val hasFiles = user.files.any { it.serverId != null }
+                if (hasText || hasFiles) {
+                    addJsonObject { put("role", "user"); put("content", userContent(user)) }
                     addJsonObject { put("role", "assistant"); put("content", assistantContent(reply)) }
                 }
                 i += 2
@@ -108,7 +133,7 @@ object RequestBuilder {
             }
         }
         addJsonObject { put("role", "latest_reminder"); put("content", latestReminder()) }
-        addJsonObject { put("role", "user"); put("content", question.content) }
+        addJsonObject { put("role", "user"); put("content", userContent(question)) }
         if (prefix != null) {
             val content = prefixContent(prefix, thinking)
             val hasContent = content.any { el ->

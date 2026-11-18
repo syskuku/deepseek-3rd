@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
@@ -12,6 +13,7 @@ import androidx.lifecycle.viewModelScope
 import com.dschat.app.BuildConfig
 import com.dschat.app.DeepSeekApp
 import com.dschat.app.data.ChatMessage
+import com.dschat.app.data.FileMeta
 import com.dschat.app.data.HistoryArchive
 import com.dschat.app.data.ReplyBlock
 import com.dschat.app.data.SearchResult
@@ -21,6 +23,7 @@ import com.dschat.app.data.SessionStore
 import com.dschat.app.net.ApiCondition
 import com.dschat.app.net.ApiError
 import com.dschat.app.net.ApiErrorKind
+import com.dschat.app.net.AttachmentRules
 import com.dschat.app.net.DeepSeekClient
 import com.dschat.app.net.RequestBuilder
 import com.dschat.app.net.StreamEvent
@@ -45,6 +48,16 @@ import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
+
+/** 输入框待发送附件 */
+data class DraftAttachment(
+    val id: String,
+    val name: String,
+    val size: Long,
+    val isImage: Boolean,
+    val mimeType: String,
+    val localPath: String,
+)
 
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val settings = (app as DeepSeekApp).settings
@@ -71,6 +84,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val _hasApiKey = MutableStateFlow(settings.apiKey != null)
     val hasApiKey: StateFlow<Boolean> = _hasApiKey
 
+    private val _drafts = MutableStateFlow<List<DraftAttachment>>(emptyList())
+    val drafts: StateFlow<List<DraftAttachment>> = _drafts
+
     private val _toast = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val toast: SharedFlow<String> = _toast
 
@@ -88,7 +104,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------ settings
 
-    /** 校验并保存 API Key；失败抛出 ApiError 由 UI 展示 */
     suspend fun verifyAndSaveApiKey(key: String) {
         DeepSeekClient.verifyApiKey(key)
         settings.apiKey = key
@@ -106,16 +121,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun newChat() {
         if (_streamingSessionId.value != null) stop()
         _active.value = null
+        _drafts.value = emptyList()
     }
 
     fun openSession(id: String) {
         viewModelScope.launch {
-            val session = store.load(id)
+            val session = store.load(id)?.normalized()
             if (session == null) {
                 toast("对话加载失败，请重试")
                 _sessions.value = store.listMetas()
             } else {
                 _active.value = session
+                _drafts.value = emptyList()
             }
         }
     }
@@ -146,6 +163,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             stop()
             store.deleteAll()
             _active.value = null
+            _drafts.value = emptyList()
             refreshMetas()
             toast("删除成功")
         }
@@ -175,62 +193,160 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 替换树中某条消息 */
+    private fun Session.replaceMessage(m: ChatMessage): Session =
+        copy(messages = messages.map { if (it.id == m.id) m else it }, updatedAt = System.currentTimeMillis())
+
+    // ------------------------------------------------------------ drafts
+
+    /** 从 SAF 选择结果添加草稿（校验格式/大小/数量，原件存入私有目录） */
+    fun addDrafts(uris: List<Uri>) {
+        val context = getApplication<DeepSeekApp>()
+        viewModelScope.launch(Dispatchers.IO) {
+            val added = ArrayList<DraftAttachment>()
+            for (uri in uris) {
+                var name = "file"
+                var size = 0L
+                runCatching {
+                    context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                        if (c.moveToFirst()) {
+                            val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            val si = c.getColumnIndex(OpenableColumns.SIZE)
+                            if (ni >= 0) name = c.getString(ni) ?: name
+                            if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+                        }
+                    }
+                }
+                val mime = context.contentResolver.getType(uri) ?: ""
+                val isImage = mime.startsWith("image/") || AttachmentRules.isImageExt(name)
+                val error = AttachmentRules.validate(name, size, isImage, _drafts.value.size + added.size)
+                if (error != null) {
+                    withContext(Dispatchers.Main) { toast(error) }
+                    continue
+                }
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: continue
+                val id = SessionStore.newId()
+                val rel = store.saveAttachment("drafts", id, name, bytes)
+                added += DraftAttachment(id, name, bytes.size.toLong(), isImage, AttachmentRules.mimeOf(name, mime), rel)
+            }
+            withContext(Dispatchers.Main) {
+                if (added.isNotEmpty()) _drafts.value = _drafts.value + added
+            }
+        }
+    }
+
+    fun removeDraft(id: String) {
+        val draft = _drafts.value.find { it.id == id } ?: return
+        _drafts.value = _drafts.value.filter { it.id != id }
+        viewModelScope.launch(Dispatchers.IO) { runCatching { store.attachmentFile(draft.localPath).delete() } }
+    }
+
     // ------------------------------------------------------------ chat
 
     fun send(text: String) {
         val content = text.trim()
-        if (content.isEmpty() || _streamingSessionId.value != null) return
+        val drafts = _drafts.value
+        if ((content.isEmpty() && drafts.isEmpty()) || _streamingSessionId.value != null) return
         val apiKey = settings.apiKey
         if (apiKey == null) { toast("请先设置 API Key"); return }
 
         val now = System.currentTimeMillis()
-        var session = _active.value
-        if (session == null) {
-            session = Session(SessionStore.newId(), "", now, now, emptyList())
-            _active.value = session
+        var session = (_active.value ?: Session(SessionStore.newId(), "", now, now, emptyList())).normalized()
+        val visible = session.visibleMessages()
+        val parentId = visible.lastOrNull()?.id
+
+        val files = drafts.map { d ->
+            FileMeta(d.id, d.name, d.size, d.isImage, d.mimeType, d.localPath, null)
         }
-        val userMsg = ChatMessage(SessionStore.newId(), "user", now, content = content)
+        val userMsg = ChatMessage(
+            SessionStore.newId(), "user", now, content = content, files = files,
+            parentId = parentId,
+        )
+        val assistant = ChatMessage(
+            SessionStore.newId(), "assistant", now + 1,
+            status = "streaming", thinking = _thinking.value, search = _search.value,
+            parentId = userMsg.id,
+        )
+        session = session.copy(
+            messages = session.messages.map {
+                if (it.id == parentId) it.copy(selectedChildId = userMsg.id) else it
+            } + userMsg + assistant,
+            rootMessageId = session.rootMessageId ?: userMsg.id,
+            updatedAt = now,
+        )
+        _active.value = session
+        _drafts.value = emptyList()
+        upsertMeta(session)
+        startStream(session, userMsg, assistant, prefix = null, apiKey = apiKey)
+    }
+
+    /** 重新生成：在同一提问下新建兄弟分支（官方 appendBranch 语义） */
+    fun regenerate(assistantId: String) {
+        val session = _active.value?.normalized() ?: return
+        if (_streamingSessionId.value != null) return
+        val apiKey = settings.apiKey ?: return
+        val original = session.messages.find { it.id == assistantId } ?: return
+        if (original.role != "assistant") return
+        val question = session.messages.find { it.id == original.parentId } ?: return
+        if (question.role != "user") return
+
+        val now = System.currentTimeMillis()
         val assistant = ChatMessage(
             SessionStore.newId(), "assistant", now,
-            status = "streaming", thinking = _thinking.value, search = _search.value,
+            status = "streaming", thinking = original.thinking, search = original.search,
+            parentId = question.id,
         )
         val base = session.copy(
-            messages = session.messages + userMsg + assistant,
+            messages = session.messages.map {
+                if (it.id == question.id) it.copy(selectedChildId = assistant.id) else it
+            } + assistant,
             updatedAt = now,
         )
         _active.value = base
         upsertMeta(base)
-        startStream(base, userMsg, assistant, prefix = null, apiKey = apiKey)
+        startStream(base, question, assistant, prefix = null, apiKey = apiKey)
     }
 
-    /** 重试最后一条失败回复 */
-    fun retryLast() {
-        val session = _active.value ?: return
-        if (_streamingSessionId.value != null) return
-        val apiKey = settings.apiKey ?: return
-        val last = session.messages.lastOrNull() ?: return
-        if (last.role != "assistant" || last.status != "error") return
-        val question = session.messages.dropLast(1).lastOrNull { it.role == "user" } ?: return
-        val assistant = last.copy(status = "streaming", errorText = null, blocks = emptyList(), stopReason = null)
-        val base = session.copy(messages = session.messages.dropLast(1) + assistant, updatedAt = System.currentTimeMillis())
+    /** 切换消息版本（官方 selectVersion） */
+    fun switchVersion(messageId: String, targetId: String) {
+        val session = _active.value?.normalized() ?: return
+        val target = session.messages.find { it.id == targetId } ?: return
+        val parentId = target.parentId
+        val base = if (parentId == null) {
+            session.copy(rootMessageId = target.id, updatedAt = System.currentTimeMillis())
+        } else {
+            session.copy(
+                messages = session.messages.map {
+                    if (it.id == parentId) it.copy(selectedChildId = target.id) else it
+                },
+                updatedAt = System.currentTimeMillis(),
+            )
+        }
         _active.value = base
-        startStream(base, question, assistant, prefix = null, apiKey = apiKey)
+        upsertMeta(base)
+        viewModelScope.launch { persistActive(force = true) }
+    }
+
+    fun retryLast() {
+        val last = _active.value?.visibleMessages()?.lastOrNull() ?: return
+        if (last.role == "assistant" && last.status == "error") regenerate(last.id)
     }
 
     /** 继续生成（停止或达到长度上限的回复） */
     fun continueLast() {
-        val session = _active.value ?: return
+        val session = _active.value?.normalized() ?: return
         if (_streamingSessionId.value != null) return
         val apiKey = settings.apiKey ?: return
-        val last = session.messages.lastOrNull() ?: return
+        val visible = session.visibleMessages()
+        val last = visible.lastOrNull() ?: return
         val canContinue = last.role == "assistant" &&
             (last.status == "stopped" || (last.status == "done" && last.stopReason == "max_tokens")) &&
             last.stopReason != "refusal" &&
             last.blocks.none { it is ReplyBlock.Text && it.isTemplate }
         if (!canContinue) return
-        val question = session.messages.dropLast(1).lastOrNull { it.role == "user" } ?: return
+        val question = visible.dropLast(1).lastOrNull { it.role == "user" } ?: return
         val assistant = last.copy(status = "streaming")
-        val base = session.copy(messages = session.messages.dropLast(1) + assistant, updatedAt = System.currentTimeMillis())
+        val base = session.replaceMessage(assistant)
         _active.value = base
         startStream(base, question, assistant, prefix = last, apiKey = apiKey)
     }
@@ -238,6 +354,37 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() {
         streamJob?.cancel()
     }
+
+    /** 发送前补传缺少 serverId 的本地原件（官方：导入附件首次用于请求时上传） */
+    private suspend fun ensureUploaded(session: Session): Session {
+        var result = session
+        val targets = result.visibleMessages().filter { it.role == "user" && it.files.any { f -> f.serverId == null && f.localPath != null } }
+        for (m in targets) {
+            val updatedFiles = m.files.toMutableList()
+            for ((i, f) in updatedFiles.withIndex()) {
+                if (f.serverId != null || f.localPath == null) continue
+                val file = store.attachmentFile(f.localPath)
+                if (!file.exists()) continue
+                val bytes = withContext(Dispatchers.IO) { file.readBytes() }
+                val serverId = DeepSeekClient.uploadFile(
+                    settings.apiKey ?: "", f.name, f.mimeType,
+                    AttachmentRules.purposeOf(f.name, f.isImage), bytes,
+                )
+                updatedFiles[i] = f.copy(serverId = serverId)
+            }
+            result = result.replaceMessage(m.copy(files = updatedFiles))
+        }
+        return result
+    }
+
+    /** 附件 file_id 失效：清空全部 serverId 以便重传 */
+    private fun Session.invalidateFileIds(): Session = copy(
+        messages = messages.map { m ->
+            if (m.role == "user" && m.files.any { it.serverId != null }) {
+                m.copy(files = m.files.map { it.copy(serverId = null) })
+            } else m
+        },
+    )
 
     private fun startStream(
         base: Session,
@@ -254,34 +401,30 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val requestTitle = base.title.isBlank()
             var receivedContent = false
             var attempt = 0
+            var fileRetryUsed = false
             var finished = false
+            var currentBase = base
 
             fun pushReply() {
                 updateActive { s ->
-                    if (s.id != sessionId) s
-                    else s.copy(
-                        messages = s.messages.map { if (it.id == reply.id) reply else it },
-                        updatedAt = System.currentTimeMillis(),
-                    )
+                    if (s.id != sessionId) s else s.replaceMessage(reply)
                 }
             }
 
             try {
                 while (!finished) {
                     try {
-                        val history = base.messages.dropLast(2).let {
-                            // base 末尾是 user + assistant；续写时末尾 assistant 即 prefix
-                            if (prefix != null) base.messages.dropLast(2) else it
-                        }
-                        val messages = RequestBuilder.toRequestMessages(
-                            history = history,
-                            question = question,
-                            prefix = prefix,
-                            thinking = reply.thinking,
-                        )
-                        val body = RequestBuilder.buildBody(messages, reply.thinking, reply.search, requestTitle && base.title.isBlank())
+                        // 补传附件（含历史轮次缺失的 serverId）
+                        currentBase = ensureUploaded(currentBase)
+                        _active.value = currentBase
+                        val visible = currentBase.visibleMessages()
+                        val history = visible.dropLast(2)
+                        val liveQuestion = visible.find { it.id == question.id } ?: question
+                        val messages = RequestBuilder.toRequestMessages(history, liveQuestion, prefix, reply.thinking)
+                        val hasFiles = RequestBuilder.hasFileBlocks(history, liveQuestion)
+                        val body = RequestBuilder.buildBody(messages, reply.thinking, reply.search, requestTitle && currentBase.title.isBlank())
 
-                        DeepSeekClient.streamMessage(apiKey, body).collect { event ->
+                        DeepSeekClient.streamMessage(apiKey, body, hasFiles).collect { event ->
                             receivedContent = receivedContent || event is StreamEvent.BlockStart
                             reply = applyEvent(reply, event, blockIndexes)
                             if (event is StreamEvent.MessageDelta) {
@@ -295,7 +438,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             if (event is StreamEvent.MessageStop) finished = true
                         }
                         if (!finished) throw ApiError(ApiErrorKind.INTERRUPTED, "")
-                        // 正常结束
                         reply = settle(reply, "done")
                         finished = true
                     } catch (e: CancellationException) {
@@ -304,6 +446,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         withContext(NonCancellable) { persistActive(force = true) }
                         throw e
                     } catch (e: Throwable) {
+                        // 附件失效：重传一次
+                        if (!fileRetryUsed && e is ApiError && AttachmentRules.isFileIdError(e.status, e.message)) {
+                            fileRetryUsed = true
+                            currentBase = currentBase.invalidateFileIds()
+                            _active.value = currentBase
+                            continue
+                        }
                         if (isRetryable(e) && !receivedContent && attempt < 2) {
                             attempt += 1
                             delay(1000L * (1 shl attempt))
@@ -319,7 +468,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 pushReply()
                 persistActive(force = true)
             } catch (_: CancellationException) {
-                // 用户停止：settle 已在上面完成
+                // 用户停止
             } finally {
                 _streamingSessionId.value = null
                 withContext(NonCancellable) { persistActive(force = true) }
@@ -337,7 +486,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         ApiCondition.OTHER -> (e.message?.takeIf { it.isNotBlank() } ?: "未知错误")
     }
 
-    /** 对照官方 applyEvent：合并流式事件到回复 */
     private fun applyEvent(reply: ChatMessage, event: StreamEvent, blockIndexes: HashMap<Int, Int>): ChatMessage {
         fun updateBlock(index: Int, transform: (ReplyBlock) -> ReplyBlock): ChatMessage {
             val local = blockIndexes[index] ?: return reply
@@ -369,16 +517,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         } else null
                     }
                     "web_search_tool_result" -> {
-                        // 合并进最近的搜索块
                         val results = block["content"]?.jsonArray?.mapNotNull { it as? JsonObject }
                             ?.filter { it.str("type") == "web_search_result" }
                             ?.map { r ->
-                                SearchResult(
-                                    url = r.str("url") ?: "",
-                                    title = r.str("title") ?: "",
-                                    snippet = r.str("snippet") ?: "",
-                                    siteName = r.str("site_name"),
-                                )
+                                SearchResult(r.str("url") ?: "", r.str("title") ?: "", r.str("snippet") ?: "", r.str("site_name"))
                             } ?: emptyList()
                         val failed = block["content"]?.jsonArray?.any {
                             (it as? JsonObject)?.str("type") == "web_search_tool_result_error"
@@ -424,7 +566,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 对照官方 settleReply：收尾思考块；拒绝时丢弃思考与正文，保留模板提示 */
     private fun settle(reply: ChatMessage, status: String): ChatMessage {
         val now = System.currentTimeMillis()
         val refusal = reply.stopReason == "refusal"
@@ -435,10 +576,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             blocks = blocks.filter { it !is ReplyBlock.Thinking && it !is ReplyBlock.Text }
             blocks = blocks + ReplyBlock.Text("你好，这个问题我暂时无法回答，让我们换个话题再聊聊吧。", isTemplate = true)
         }
-        return reply.copy(
-            status = if (refusal) "refusal" else status,
-            blocks = blocks,
-        )
+        return reply.copy(status = if (refusal) "refusal" else status, blocks = blocks)
     }
 
     private fun JsonObject.str(key: String): String? =
@@ -446,14 +584,24 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------ import / export
 
-    /** 导入历史对话 ZIP（覆盖全部本地会话）；返回导入数量，失败抛异常 */
-    suspend fun importArchive(input: InputStream): Int = withContext(Dispatchers.IO) {
+    /** 导入历史对话 ZIP（覆盖全部本地会话，含图片原件与消息分支） */
+    suspend fun importArchive(openStream: () -> InputStream): Int = withContext(Dispatchers.IO) {
         _busy.value = true
         try {
-            val sessions = HistoryArchive.import(input)
+            // 先清旧附件，再提取新原件（replaceAll 只替换会话，不动附件）
+            store.clearAttachments()
+            val sessions = HistoryArchive.import(openStream) { entryName, bytes ->
+                // 条目名 chat_sessions/{sid}_files/{fid}_{name}
+                val sid = entryName.removePrefix("chat_sessions/").substringBefore("_files/")
+                val fid = entryName.substringAfterLast("/").substringBefore("_")
+                store.saveAttachment(sid, fid, entryName.substringAfterLast("/"), bytes)
+            }
             stop()
             store.replaceAll(sessions)
-            _active.value = null
+            withContext(Dispatchers.Main) {
+                _active.value = null
+                _drafts.value = emptyList()
+            }
             refreshMetas()
             sessions.size
         } finally {
@@ -465,20 +613,27 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _busy.value = true
         try {
             val metas = store.listMetas()
-            val sessions = metas.mapNotNull { store.load(it.id) }
+            val sessions = metas.mapNotNull { store.load(it.id)?.normalized() }
             if (sessions.isEmpty()) throw IllegalStateException("没有可导出的对话")
-            HistoryArchive.export(sessions, output)
+            HistoryArchive.export(sessions, { f ->
+                f.localPath?.let { p ->
+                    val file = store.attachmentFile(p)
+                    if (file.exists()) runCatching { file.readBytes() }.getOrNull() else null
+                }
+            }, output)
         } finally {
             _busy.value = false
         }
     }
+
+    /** 附件原件文件（供缩略图加载） */
+    fun attachmentFile(relPath: String): File = store.attachmentFile(relPath)
 
     // ------------------------------------------------------------ in-app update
 
     private val _updateInfo = MutableStateFlow<UpdateChecker.UpdateInfo?>(null)
     val updateInfo: StateFlow<UpdateChecker.UpdateInfo?> = _updateInfo
 
-    /** null = 未在下载；0..1 = 进度 */
     private val _updateProgress = MutableStateFlow<Float?>(null)
     val updateProgress: StateFlow<Float?> = _updateProgress
 
@@ -490,7 +645,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private var updateJob: Job? = null
 
-    /** 检查 GitHub 最新 Release；manual=true 时无更新也提示 */
     fun checkUpdate(manual: Boolean) {
         if (updateJob?.isActive == true) return
         updateJob = viewModelScope.launch {
@@ -545,7 +699,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _updateProgress.value = null
     }
 
-    /** 通过 FileProvider 调起系统安装器；未授权未知来源时先跳转设置 */
     fun installUpdate(context: Context) {
         val file = _downloadedApk.value ?: return
         if (Build.VERSION.SDK_INT >= 26 && !context.packageManager.canRequestPackageInstalls()) {

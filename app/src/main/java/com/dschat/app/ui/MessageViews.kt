@@ -22,8 +22,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Language
@@ -42,65 +44,145 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
 import com.dschat.app.data.ChatMessage
 import com.dschat.app.data.ReplyBlock
+import com.dschat.app.data.Session
+import com.dschat.app.net.AttachmentRules
 import com.dschat.app.ui.theme.LocalDsColors
+import java.io.File
 
-/** 用户消息：右对齐气泡，圆角 22dp，padding 10x16，16sp/24，blue-50 背景（原版 UserMessage） */
+/** 消息版本切换器（官方 BranchSwitcher）：‹ 2/3 › */
 @Composable
-fun UserMessageView(message: ChatMessage) {
+fun BranchSwitcher(
+    session: Session,
+    message: ChatMessage,
+    onSwitch: (String) -> Unit,
+) {
     val ds = LocalDsColors.current
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-        horizontalAlignment = Alignment.End,
+    val siblings = remember(session.messages, message.id) { session.siblingsOf(message) }
+    if (siblings.size <= 1) return
+    val index = siblings.indexOfFirst { it.id == message.id }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(bottom = 4.dp),
     ) {
-        if (message.files.isNotEmpty()) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                message.files.forEach { f ->
-                    Box(
-                        modifier = Modifier
-                            .background(ds.tag, RoundedCornerShape(10.dp))
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
-                    ) {
-                        Text(
-                            f.name,
-                            fontSize = 12.sp,
-                            color = ds.labelSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.widthIn(max = 160.dp),
-                        )
-                    }
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-        }
-        Box(
-            modifier = Modifier
-                .widthIn(max = 320.dp)
-                .background(ds.bubble, RoundedCornerShape(22.dp))
-                .padding(horizontal = 16.dp, vertical = 10.dp),
+        IconButton(
+            onClick = { if (index > 0) onSwitch(siblings[index - 1].id) },
+            enabled = index > 0,
+            modifier = Modifier.size(24.dp),
         ) {
-            Text(
-                message.content,
-                fontSize = 16.sp,
-                lineHeight = 24.sp,
-                color = ds.labelPrimary,
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowLeft, "上一个版本",
+                tint = if (index > 0) ds.labelSecondary else ds.labelDimmed,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+        Text(
+            "${index + 1}/${siblings.size}",
+            fontSize = 12.sp,
+            color = ds.labelTertiary,
+            modifier = Modifier.padding(horizontal = 2.dp),
+        )
+        IconButton(
+            onClick = { if (index < siblings.lastIndex) onSwitch(siblings[index + 1].id) },
+            enabled = index < siblings.lastIndex,
+            modifier = Modifier.size(24.dp),
+        ) {
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight, "下一个版本",
+                tint = if (index < siblings.lastIndex) ds.labelSecondary else ds.labelDimmed,
+                modifier = Modifier.size(16.dp),
             )
         }
     }
 }
 
-/** 等待中的三个渐隐圆点（原版 AssistantMessage.waiting） */
+/** 附件展示：图片缩略图 / 文档卡片 */
+@Composable
+fun AttachmentRow(message: ChatMessage, fileOf: (String) -> File) {
+    val ds = LocalDsColors.current
+    if (message.files.isEmpty()) return
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.padding(bottom = 8.dp),
+    ) {
+        message.files.forEach { f ->
+            if (f.isImage && f.localPath != null) {
+                AsyncImage(
+                    model = fileOf(f.localPath),
+                    contentDescription = f.name,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(ds.tag),
+                )
+            } else {
+                Row(
+                    modifier = Modifier
+                        .background(ds.tag, RoundedCornerShape(12.dp))
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.Description, null, tint = ds.labelTertiary, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Column {
+                        Text(
+                            f.name,
+                            fontSize = 12.sp,
+                            color = ds.labelPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.widthIn(max = 140.dp),
+                        )
+                        Text(AttachmentRules.formatSize(f.size), fontSize = 10.sp, color = ds.labelTertiary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 用户消息：右对齐气泡 + 附件 + 版本切换 */
+@Composable
+fun UserMessageView(
+    message: ChatMessage,
+    session: Session,
+    fileOf: (String) -> File,
+    onSwitchVersion: (String) -> Unit,
+) {
+    val ds = LocalDsColors.current
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+        horizontalAlignment = Alignment.End,
+    ) {
+        BranchSwitcher(session, message) { onSwitchVersion(it) }
+        AttachmentRow(message, fileOf)
+        if (message.content.isNotEmpty()) {
+            Box(
+                modifier = Modifier
+                    .widthIn(max = 320.dp)
+                    .background(ds.bubble, RoundedCornerShape(22.dp))
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+            ) {
+                Text(message.content, fontSize = 16.sp, lineHeight = 24.sp, color = ds.labelPrimary)
+            }
+        }
+    }
+}
+
+/** 等待中的三个渐隐圆点 */
 @Composable
 fun WaitingDots() {
     val ds = LocalDsColors.current
@@ -112,22 +194,19 @@ fun WaitingDots() {
     ) {
         repeat(3) { i ->
             val alpha by transition.animateFloat(
-                initialValue = 0.3f,
-                targetValue = 1f,
+                initialValue = 0.3f, targetValue = 1f,
                 animationSpec = infiniteRepeatable(
                     animation = tween(900, delayMillis = i * 100, easing = LinearEasing),
                     repeatMode = RepeatMode.Reverse,
                 ),
                 label = "dot$i",
             )
-            Box(
-                Modifier.size(6.dp).alpha(alpha).background(ds.labelDimmed, CircleShape),
-            )
+            Box(Modifier.size(6.dp).alpha(alpha).background(ds.labelDimmed, CircleShape))
         }
     }
 }
 
-/** 思考区：标题行 + 左侧竖线 + 14sp 次要色内容（原版 ReplyArea + thinking.markdown.css） */
+/** 思考区：标题行 + 左侧竖线 + 次要色内容 */
 @Composable
 fun ThinkingSection(block: ReplyBlock.Thinking, streaming: Boolean) {
     val ds = LocalDsColors.current
@@ -136,7 +215,6 @@ fun ThinkingSection(block: ReplyBlock.Thinking, streaming: Boolean) {
         maxOf(1, Math.round((block.endedAt - block.startedAt) / 1000.0))
     } else null
     val thinkingNow = streaming && block.endedAt == null
-
     val title = when {
         thinkingNow -> "正在思考"
         seconds != null -> "已思考（用时 $seconds 秒）"
@@ -145,58 +223,39 @@ fun ThinkingSection(block: ReplyBlock.Thinking, streaming: Boolean) {
 
     Column(modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(34.dp)
-                .clickable { expanded = !expanded },
+            modifier = Modifier.fillMaxWidth().height(34.dp).clickable { expanded = !expanded },
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                Icons.Filled.Psychology,
-                contentDescription = null,
+                Icons.Filled.Psychology, null,
                 tint = if (thinkingNow) ds.brand else ds.labelTertiary,
                 modifier = Modifier.size(18.dp),
             )
             Spacer(Modifier.width(6.dp))
-            Text(
-                title,
-                fontSize = 16.sp,
-                lineHeight = 28.sp,
-                color = ds.labelSecondary,
-                modifier = Modifier.weight(1f, fill = false),
-            )
+            Text(title, fontSize = 16.sp, lineHeight = 28.sp, color = ds.labelSecondary, modifier = Modifier.weight(1f, fill = false))
             Spacer(Modifier.width(6.dp))
             Icon(
-                Icons.Filled.ExpandMore,
-                contentDescription = if (expanded) "收起" else "展开",
+                Icons.Filled.ExpandMore, if (expanded) "收起" else "展开",
                 tint = ds.labelTertiary,
                 modifier = Modifier.size(18.dp).rotate(if (expanded) 180f else 0f),
             )
         }
         if (expanded || thinkingNow) {
             Box(modifier = Modifier.fillMaxWidth().padding(start = 7.dp)) {
-                // 左侧 1px 竖线
                 Box(
-                    Modifier
-                        .align(Alignment.TopStart)
-                        .width(1.dp)
+                    Modifier.align(Alignment.TopStart).width(1.dp)
                         .height(if (block.thinking.length > 200) 200.dp else 40.dp)
                         .background(ds.labelDimmed),
                 )
                 Box(Modifier.padding(start = 15.dp, top = 5.dp, bottom = 5.dp)) {
-                    MarkdownText(
-                        markdown = block.thinking,
-                        textColor = ds.labelSecondary.toArgb(),
-                        linkColor = ds.brandText.toArgb(),
-                        textSizeSp = 14f,
-                    )
+                    MarkdownText(block.thinking, ds.labelSecondary.toArgb(), ds.brandText.toArgb(), textSizeSp = 14f)
                 }
             }
         }
     }
 }
 
-/** 搜索步骤行：圆点 + 「搜索到 N 个网页」，可展开来源（原版 ReplyArea.row / summary） */
+/** 搜索步骤行 */
 @Composable
 fun SearchSection(block: ReplyBlock.Search) {
     val ds = LocalDsColors.current
@@ -206,25 +265,14 @@ fun SearchSection(block: ReplyBlock.Search) {
 
     Column(modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
         Row(
-            modifier = Modifier
-                .height(34.dp)
-                .clickable(enabled = block.results.isNotEmpty()) { expanded = !expanded },
+            modifier = Modifier.height(34.dp).clickable(enabled = block.results.isNotEmpty()) { expanded = !expanded },
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(Modifier.size(16.dp), contentAlignment = Alignment.Center) {
-                Box(
-                    Modifier
-                        .size(5.dp)
-                        .background(if (searching) ds.brand else ds.labelTertiary, CircleShape),
-                )
+                Box(Modifier.size(5.dp).background(if (searching) ds.brand else ds.labelTertiary, CircleShape))
             }
             Spacer(Modifier.width(6.dp))
-            Icon(
-                Icons.Filled.Search,
-                contentDescription = null,
-                tint = ds.labelSecondary,
-                modifier = Modifier.size(14.dp),
-            )
+            Icon(Icons.Filled.Search, null, tint = ds.labelSecondary, modifier = Modifier.size(14.dp))
             Spacer(Modifier.width(6.dp))
             Text(
                 when {
@@ -233,14 +281,11 @@ fun SearchSection(block: ReplyBlock.Search) {
                     block.results.isEmpty() -> "未搜索到相关内容"
                     else -> "搜索到 ${block.results.size} 个网页"
                 },
-                fontSize = 14.sp,
-                lineHeight = 24.sp,
-                color = ds.labelSecondary,
+                fontSize = 14.sp, lineHeight = 24.sp, color = ds.labelSecondary,
             )
             if (block.results.isNotEmpty()) {
                 Icon(
-                    Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                    contentDescription = null,
+                    Icons.AutoMirrored.Filled.KeyboardArrowRight, null,
                     tint = ds.labelTertiary,
                     modifier = Modifier.size(16.dp).rotate(if (expanded) 90f else 0f),
                 )
@@ -263,11 +308,8 @@ fun SearchSection(block: ReplyBlock.Search) {
                         Spacer(Modifier.width(4.dp))
                         Text(
                             r.title.ifBlank { r.url },
-                            fontSize = 13.sp,
-                            lineHeight = 20.sp,
-                            color = ds.labelSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
+                            fontSize = 13.sp, lineHeight = 20.sp, color = ds.labelSecondary,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.widthIn(max = 260.dp),
                         )
                     }
@@ -277,13 +319,16 @@ fun SearchSection(block: ReplyBlock.Search) {
     }
 }
 
-/** 助手消息：思考/搜索步骤 + Markdown 正文 + 错误提示 + 操作行 */
+/** 助手消息：版本切换 + 思考/搜索 + 富文本正文 + 错误 + 操作行 */
 @Composable
 fun AssistantMessageView(
     message: ChatMessage,
+    session: Session,
     isLast: Boolean,
     onRetry: () -> Unit,
     onContinue: () -> Unit,
+    onRegenerate: () -> Unit,
+    onSwitchVersion: (String) -> Unit,
     onCopied: () -> Unit,
 ) {
     val ds = LocalDsColors.current
@@ -293,11 +338,12 @@ fun AssistantMessageView(
         (message.status == "stopped" || (message.status == "done" && message.stopReason == "max_tokens")) &&
         message.stopReason != "refusal" &&
         message.blocks.none { it is ReplyBlock.Text && it.isTemplate }
+    val canRegenerate = !streaming && message.status != "refusal"
 
     Column(modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
-        if (streaming && message.blocks.isEmpty()) {
-            WaitingDots()
-        }
+        BranchSwitcher(session, message) { onSwitchVersion(it) }
+
+        if (streaming && message.blocks.isEmpty()) WaitingDots()
 
         message.blocks.forEach { block ->
             when (block) {
@@ -305,28 +351,16 @@ fun AssistantMessageView(
                 is ReplyBlock.Search -> SearchSection(block)
                 is ReplyBlock.Text -> {
                     if (block.isTemplate) {
-                        // 模板/拒绝提示：红字 + 感叹号（原版 notice）
                         Row(modifier = Modifier.padding(top = 8.dp)) {
-                            Icon(
-                                Icons.Filled.ErrorOutline,
-                                null,
-                                tint = ds.error,
-                                modifier = Modifier.size(16.dp).padding(top = 3.dp),
-                            )
+                            Icon(Icons.Filled.ErrorOutline, null, tint = ds.error, modifier = Modifier.size(16.dp).padding(top = 3.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text(
-                                block.text,
-                                fontSize = 14.sp,
-                                lineHeight = 22.sp,
-                                color = ds.error,
-                            )
+                            Text(block.text, fontSize = 14.sp, lineHeight = 22.sp, color = ds.error)
                         }
                     } else if (block.text.isNotEmpty()) {
-                        MarkdownText(
-                            markdown = block.text,
+                        RichContent(
+                            text = block.text,
                             textColor = ds.labelPrimary.toArgb(),
                             linkColor = ds.brandText.toArgb(),
-                            textSizeSp = 16f,
                             modifier = Modifier.padding(bottom = 6.dp),
                         )
                     }
@@ -334,37 +368,20 @@ fun AssistantMessageView(
             }
         }
 
-        // 错误提示 + 重试
         if (message.status == "error" && message.errorText != null) {
             Row(modifier = Modifier.padding(top = 8.dp), verticalAlignment = Alignment.Top) {
                 Icon(Icons.Filled.ErrorOutline, null, tint = ds.error, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(6.dp))
-                Text(
-                    message.errorText,
-                    fontSize = 14.sp,
-                    lineHeight = 22.sp,
-                    color = ds.error,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
+                Text(message.errorText, fontSize = 14.sp, lineHeight = 22.sp, color = ds.error, modifier = Modifier.weight(1f, fill = false))
                 if (message.errorRetryable) {
                     Spacer(Modifier.width(8.dp))
-                    Text(
-                        "重试",
-                        fontSize = 14.sp,
-                        lineHeight = 22.sp,
-                        color = ds.brandText,
-                        modifier = Modifier.clickable(onClick = onRetry),
-                    )
+                    Text("重试", fontSize = 14.sp, lineHeight = 22.sp, color = ds.brandText, modifier = Modifier.clickable(onClick = onRetry))
                 }
             }
         }
 
-        // 底部操作：复制 / 继续生成
         if (!streaming && (message.replyText.isNotEmpty() || message.status == "error")) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            Row(modifier = Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (message.replyText.isNotEmpty()) {
                     IconButton(onClick = {
                         clipboard.setText(AnnotatedString(message.replyText))
@@ -372,12 +389,17 @@ fun AssistantMessageView(
                     }, modifier = Modifier.size(28.dp)) {
                         Icon(Icons.Filled.ContentCopy, "复制", tint = ds.labelTertiary, modifier = Modifier.size(16.dp))
                     }
-                    if (message.status == "stopped") {
-                        Spacer(Modifier.width(4.dp))
-                        Icon(Icons.Filled.StopCircle, null, tint = ds.labelCaption, modifier = Modifier.size(14.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("已停止", fontSize = 12.sp, color = ds.labelCaption)
+                }
+                if (canRegenerate) {
+                    IconButton(onClick = onRegenerate, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Filled.Refresh, "重新生成", tint = ds.labelTertiary, modifier = Modifier.size(16.dp))
                     }
+                }
+                if (message.status == "stopped") {
+                    Spacer(Modifier.width(4.dp))
+                    Icon(Icons.Filled.StopCircle, null, tint = ds.labelCaption, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("已停止", fontSize = 12.sp, color = ds.labelCaption)
                 }
                 Spacer(Modifier.weight(1f))
                 if (canContinue) {

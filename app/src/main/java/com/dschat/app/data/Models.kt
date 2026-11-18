@@ -11,13 +11,18 @@ data class SessionMeta(
     val updatedAt: Long,
 )
 
-/** 附件元数据（导入归档时保留文件名/大小；v1 不导入图片原件） */
+/** 附件：本地原件 + Files API serverId（发送前补传） */
 @Serializable
 data class FileMeta(
     val id: String,
     val name: String,
     val size: Long,
     val isImage: Boolean,
+    val mimeType: String = "",
+    /** 相对 filesDir 的原件路径，可空（仅元数据的历史附件） */
+    val localPath: String? = null,
+    /** Files API 返回的 file_id */
+    val serverId: String? = null,
 )
 
 /** 搜索结果条目 */
@@ -29,7 +34,7 @@ data class SearchResult(
     val siteName: String? = null,
 )
 
-/** 助手回复内容块，与官方 demo 的 ReplyBlock 对应（简化：不含 read_link 签名回传） */
+/** 助手回复内容块 */
 @Serializable
 sealed class ReplyBlock {
     @Serializable
@@ -53,8 +58,9 @@ sealed class ReplyBlock {
 }
 
 /**
- * 一条消息。role: user / assistant。
+ * 一条消息（树节点）。role: user / assistant。
  * status: pending / streaming / done / stopped / error / refusal
+ * parentId/selectedChildId 对照官方 branches.ts。
  */
 @Serializable
 data class ChatMessage(
@@ -70,6 +76,8 @@ data class ChatMessage(
     val errorText: String? = null,
     val errorRetryable: Boolean = false,
     val files: List<FileMeta> = emptyList(),
+    val parentId: String? = null,
+    val selectedChildId: String? = null,
 ) {
     val replyText: String
         get() = blocks.joinToString("") { if (it is ReplyBlock.Text && !it.isTemplate) it.text else "" }
@@ -77,11 +85,11 @@ data class ChatMessage(
     val templateText: String?
         get() = blocks.filterIsInstance<ReplyBlock.Text>().firstOrNull { it.isTemplate }?.text
 
-    /** 与官方 isUsableReply 一致：结束/停止、非拒绝、无模板、有正文 */
+    /** 与官方 isUsableReply 一致 */
     val isUsableReply: Boolean
         get() = role == "assistant" &&
             (status == "done" || status == "stopped") &&
-            status != "refusal" && stopReason != "refusal" &&
+            stopReason != "refusal" &&
             blocks.none { it is ReplyBlock.Text && it.isTemplate } &&
             replyText.isNotEmpty()
 }
@@ -93,6 +101,39 @@ data class Session(
     val createdAt: Long,
     val updatedAt: Long,
     val messages: List<ChatMessage>,
+    val rootMessageId: String? = null,
 ) {
     fun meta() = SessionMeta(id, title, createdAt, updatedAt)
+
+    private fun byId(): Map<String, ChatMessage> = messages.associateBy { it.id }
+
+    /** 当前选中分支路径（官方 getVisibleMessages） */
+    fun visibleMessages(): List<ChatMessage> {
+        val map = byId()
+        val path = ArrayList<ChatMessage>()
+        var id = rootMessageId ?: messages.firstOrNull()?.id
+        val seen = HashSet<String>()
+        while (id != null && seen.add(id)) {
+            val m = map[id] ?: break
+            path += m
+            id = m.selectedChildId
+        }
+        return path
+    }
+
+    /** 某节点的兄弟版本（含自身），按创建时间排序 */
+    fun siblingsOf(message: ChatMessage): List<ChatMessage> =
+        messages.filter { it.parentId == message.parentId }.sortedBy { it.createdAt }
+
+    /** 规范化：旧线性数据补全树字段（官方 normalizeSession） */
+    fun normalized(): Session {
+        if (rootMessageId != null || messages.isEmpty()) return this
+        val linked = messages.mapIndexed { i, m ->
+            m.copy(
+                parentId = messages.getOrNull(i - 1)?.id,
+                selectedChildId = messages.getOrNull(i + 1)?.id,
+            )
+        }
+        return copy(messages = linked, rootMessageId = linked.first().id)
+    }
 }

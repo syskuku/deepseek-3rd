@@ -172,7 +172,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             }
 
             SectionTitle("关于与开源许可")
-            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.1.3 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.2.0 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
             SettingRow(
                 title = "检查更新",
                 subtitle = "从 GitHub Releases 获取最新版本",
@@ -217,7 +217,9 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                     pendingImportUri = null
                     scope.launch {
                         try {
-                            val count = context.contentResolver.openInputStream(u)?.use { vm.importArchive(it) } ?: 0
+                            val count = vm.importArchive {
+                                context.contentResolver.openInputStream(u) ?: throw IllegalStateException("无法读取文件")
+                            }
                             vm.toast(if (count == 1) "已导入 1 个对话" else "已导入 $count 个对话")
                         } catch (e: Exception) {
                             vm.toast(e.message ?: "文件导入失败，可能是文件格式错误或使用了旧版的对话导出 ZIP 文件，请前往 DeepSeek 重新导出历史对话文件后再次导入。")

@@ -2,6 +2,7 @@ package com.dschat.app.data
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.addJsonObject
@@ -25,13 +26,11 @@ import java.util.zip.ZipOutputStream
 class ArchiveException(message: String) : Exception(message)
 
 /**
- * DeepSeek 历史对话 ZIP（export_format_version: 3）导入/导出。
- * 归档结构对照官方 src/services/chat/history/README.md：
- *   manifest.json（首个条目）
- *   chat_sessions/{id}.json（消息树）
- *   chat_session_index.json（索引）
- * 消息树以 id/parent_id 还原，current_message_id 决定当前分支。
- * v1 限制：不导入/导出图片原件，附件仅保留文件名与大小元数据。
+ * DeepSeek 历史对话 ZIP（export_format_version: 3）。
+ * 对照官方 history/README.md、toLocal.ts、toArchive.ts：
+ * - 完整消息树导入/导出（parent_id 分支、current_message_id 当前分支）；
+ * - 图片原件随导入提取、随导出附带（FILE.export_path 匹配）；
+ * - 父 id 必须小于子 id、角色交替、根为提问；其余节点默认选中 id 最大的子消息。
  */
 object HistoryArchive {
     private const val VERSION = 3
@@ -54,161 +53,187 @@ object HistoryArchive {
     }
 
     private fun JsonObject.str(key: String): String? =
-        this[key]?.takeIf { it !is kotlinx.serialization.json.JsonNull }?.jsonPrimitive?.content
+        this[key]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content
 
     private fun JsonObject.int(key: String): Int? =
-        this[key]?.takeIf { it !is kotlinx.serialization.json.JsonNull }?.jsonPrimitive?.content?.toIntOrNull()
+        this[key]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content?.toIntOrNull()
 
     private fun JsonObject.long(key: String): Long? =
-        this[key]?.takeIf { it !is kotlinx.serialization.json.JsonNull }?.jsonPrimitive?.content?.toLongOrNull()
+        this[key]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content?.toLongOrNull()
 
     private fun JsonObject.bool(key: String): Boolean =
-        this[key]?.takeIf { it !is kotlinx.serialization.json.JsonNull }?.jsonPrimitive?.content?.toBoolean() ?: false
+        this[key]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content?.toBoolean() ?: false
 
     private fun JsonObject.arr(key: String): JsonArray? = this[key] as? JsonArray
 
+    private fun String.nfc(): String = java.text.Normalizer.normalize(this, java.text.Normalizer.Form.NFC)
+
     // ---------------------------------------------------------------- import
 
-    /** 解析 ZIP 输入流为会话列表；任何容器/元数据错误抛出 ArchiveException */
-    fun import(input: InputStream): List<Session> {
-        val entries = LinkedHashMap<String, ByteArray>()
-        ZipInputStream(input.buffered()).use { zis ->
-            var entry = zis.nextEntry
-            var first = true
-            while (entry != null) {
-                if (!entry.isDirectory) {
-                    val name = entry.name.normalize()
-                    if (first) {
-                        // 首个条目必须是 manifest.json
-                        if (name != "manifest.json") throw ArchiveException("无法识别该文件，请选择 DeepSeek 导出的历史对话 ZIP 文件")
-                        val manifest = runCatching { json.parseToJsonElement(zis.readBytes().decodeToString()).jsonObject }
-                            .getOrElse { throw ArchiveException("文件不是有效的 JSON") }
-                        val version = manifest.int("export_format_version")
-                        when {
-                            version == null -> throw ArchiveException("文件版本无效，无法导入")
-                            version > VERSION -> throw ArchiveException("文件版本过新，请升级后再导入")
-                            version != VERSION -> throw ArchiveException("文件版本无效，无法导入")
+    /**
+     * @param openStream 可重复打开的 ZIP 流（SAF uri 可多次 openInputStream）
+     * @param saveImage  (ZIP 条目名, 字节) -> 本地相对路径
+     */
+    fun import(openStream: () -> InputStream, saveImage: (String, ByteArray) -> String): List<Session> {
+        val sessionJsons = LinkedHashMap<String, ByteArray>()
+        var indexBytes: ByteArray? = null
+        val referencedImages = HashSet<String>()
+
+        // 第一遍：校验 manifest、收集会话 JSON 与索引、登记被引用的图片条目
+        openStream().use { raw ->
+            ZipInputStream(raw.buffered()).use { zis ->
+                var entry = zis.nextEntry
+                var first = true
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val name = entry.name.nfc()
+                        if (first) {
+                            if (name != "manifest.json") throw ArchiveException("无法识别该文件，请选择 DeepSeek 导出的历史对话 ZIP 文件")
+                            val manifest = runCatching { json.parseToJsonElement(zis.readBytes().decodeToString()).jsonObject }
+                                .getOrElse { throw ArchiveException("文件不是有效的 JSON") }
+                            val version = manifest.int("export_format_version")
+                            when {
+                                version == null -> throw ArchiveException("文件版本无效，无法导入")
+                                version > VERSION -> throw ArchiveException("文件版本过新，请升级后再导入")
+                                version != VERSION -> throw ArchiveException("文件版本无效，无法导入")
+                            }
+                            first = false
+                        } else when {
+                            name == "chat_session_index.json" -> indexBytes = zis.readBytes()
+                            name.matches(Regex("chat_sessions/[^/]+\\.json")) -> {
+                                val bytes = zis.readBytes()
+                                sessionJsons[name] = bytes
+                                // 登记 FILE 片段引用的图片路径
+                                runCatching {
+                                    val obj = json.parseToJsonElement(bytes.decodeToString()).jsonObject
+                                    obj.arr("messages")?.forEach { m ->
+                                        (m as? JsonObject)?.arr("fragments")?.forEach { f ->
+                                            val fo = f as? JsonObject ?: return@forEach
+                                            if (fo.str("type") == "FILE") {
+                                                fo.arr("files")?.forEach { file ->
+                                                    val fo2 = file as? JsonObject ?: return@forEach
+                                                    if (fo2.bool("is_image")) {
+                                                        fo2.str("export_path")?.let { referencedImages += it.nfc() }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        first = false
-                    } else if (name == "chat_session_index.json" || name.matches(Regex("chat_sessions/[^/]+\\.json"))) {
-                        entries[name] = zis.readBytes()
                     }
-                    // user.json、图片原件等条目跳过
+                    zis.closeEntry()
+                    entry = zis.nextEntry
                 }
-                zis.closeEntry()
-                entry = zis.nextEntry
             }
         }
-        if (entries.isEmpty()) throw ArchiveException("文件内容不完整，无法导入")
-
-        val indexBytes = entries["chat_session_index.json"]
-            ?: throw ArchiveException("文件内容不完整，无法导入")
-        val index = runCatching { json.parseToJsonElement(indexBytes.decodeToString()).jsonArray }
+        if (sessionJsons.isEmpty()) throw ArchiveException("文件内容不完整，无法导入")
+        val index = runCatching { json.parseToJsonElement((indexBytes ?: throw ArchiveException("文件内容不完整，无法导入")).decodeToString()).jsonArray }
             .getOrElse { throw ArchiveException("文件不是有效的 JSON") }
 
+        // 第二遍：提取被引用的图片原件
+        val imagePaths = HashMap<String, String>()
+        if (referencedImages.isNotEmpty()) {
+            openStream().use { raw ->
+                ZipInputStream(raw.buffered()).use { zis ->
+                    var entry = zis.nextEntry
+                    while (entry != null) {
+                        if (!entry.isDirectory) {
+                            val name = entry.name.nfc()
+                            if (name in referencedImages) {
+                                imagePaths[name] = saveImage(name, zis.readBytes())
+                            }
+                        }
+                        zis.closeEntry()
+                        entry = zis.nextEntry
+                    }
+                }
+            }
+        }
+
+        // 解析会话（索引与会话一一对应）
         val sessions = ArrayList<Session>()
-        val seenIds = HashSet<String>()
+        val seen = HashSet<String>()
         for (item in index) {
             val meta = item as? JsonObject ?: throw ArchiveException("文件内容不完整，无法导入")
             val id = meta.str("id") ?: throw ArchiveException("文件内容不完整，无法导入")
-            if (!seenIds.add(id)) throw ArchiveException("文件内容不完整，无法导入")
-            val sessionBytes = entries["chat_sessions/$id.json"]
-                ?: throw ArchiveException("文件内容不完整，无法导入")
-            val sessionObj = runCatching { json.parseToJsonElement(sessionBytes.decodeToString()).jsonObject }
+            if (!seen.add(id)) throw ArchiveException("文件内容不完整，无法导入")
+            val bytes = sessionJsons["chat_sessions/$id.json"] ?: throw ArchiveException("文件内容不完整，无法导入")
+            val obj = runCatching { json.parseToJsonElement(bytes.decodeToString()).jsonObject }
                 .getOrElse { throw ArchiveException("文件不是有效的 JSON") }
-            sessions += parseSession(id, meta.str("title"), sessionObj)
+            sessions += parseSession(id, meta.str("title"), obj, imagePaths)
         }
         if (sessions.isEmpty()) throw ArchiveException("文件内容不完整，无法导入")
         return sessions
     }
 
-    private fun String.normalize(): String = java.text.Normalizer.normalize(this, java.text.Normalizer.Form.NFC)
-
-    /** 线性化消息树：从 current_message_id 沿 parent_id 回溯到根，再反转 */
-    private fun linearize(messages: List<JsonObject>, currentId: Int?): List<JsonObject> {
-        if (messages.isEmpty()) return emptyList()
-        val byId = messages.associateBy { it.int("id") ?: -1 }
-        var cursor = currentId?.let { byId[it] }
-        if (cursor == null) {
-            // 无有效 current_message_id 时取 ID 最大的叶子
-            cursor = messages.maxByOrNull { it.int("id") ?: -1 }
-        }
-        val chain = ArrayList<JsonObject>()
-        val visited = HashSet<Int>()
-        while (cursor != null) {
-            val id = cursor.int("id") ?: throw ArchiveException("文件中的消息分支已损坏，无法导入")
-            if (!visited.add(id)) throw ArchiveException("文件中的消息分支已损坏，无法导入")
-            chain += cursor
-            val parentId = cursor.int("parent_id")
-            cursor = parentId?.let { byId[it] }
-            if (parentId != null && cursor == null) throw ArchiveException("文件中的消息分支已损坏，无法导入")
-        }
-        return chain.reversed()
-    }
-
-    private fun parseSession(id: String, indexTitle: String?, obj: JsonObject): Session {
-        val rawMessages = obj.arr("messages")?.mapNotNull { it as? JsonObject }
+    /** 对照官方 toLocal.buildTree：还原完整消息树与当前分支 */
+    private fun parseSession(id: String, indexTitle: String?, obj: JsonObject, imagePaths: Map<String, String>): Session {
+        val raw = obj.arr("messages")?.mapNotNull { it as? JsonObject }
             ?: throw ArchiveException("文件内容不完整，无法导入")
-        val chain = linearize(rawMessages, obj.int("current_message_id"))
-        val createdAt = parseIso(obj.str("inserted_at"))
-        val updatedAt = parseIso(obj.str("updated_at"))
+        val sorted = raw.sortedBy { it.int("id") ?: Int.MAX_VALUE }
 
-        val messages = ArrayList<ChatMessage>()
-        for ((i, m) in chain.withIndex()) {
+        data class Node(val local: ChatMessage, val archiveId: Int, val parentArchiveId: Int?)
+
+        val nodes = ArrayList<Node>()
+        val byArchive = HashMap<Int, Node>()
+        for (m in sorted) {
+            val aid = m.int("id") ?: throw ArchiveException("文件中的消息分支已损坏，无法导入")
+            val pid = m.int("parent_id")
             val role = m.str("role") ?: throw ArchiveException("文件内容不完整，无法导入")
+            val parent = pid?.let { byArchive[it] }
+            if (byArchive.containsKey(aid) ||
+                (pid == null && role != "USER") ||
+                (pid != null && parent == null) ||
+                (parent != null && parent.local.role == (if (role == "USER") "user" else "assistant")) ||
+                (parent != null && parent.archiveId >= aid)
+            ) {
+                throw ArchiveException("文件中的消息分支已损坏，无法导入（id=$aid parent=$pid role=$role parentRole=${parent?.local?.role}）")
+            }
+            val localId = "$id-$aid"
             val insertedAt = parseIso(m.str("inserted_at"))
             val fragments = m.arr("fragments")?.mapNotNull { it as? JsonObject } ?: emptyList()
-            val msgId = "$id-$i"
-            if (role == "USER") {
-                val content = fragments.filter { it.str("type") == "REQUEST" }
-                    .joinToString("") { it.str("content") ?: "" }
+
+            val local = if (role == "USER") {
+                val content = fragments.filter { it.str("type") == "REQUEST" }.joinToString("") { it.str("content") ?: "" }
                 val files = fragments.filter { it.str("type") == "FILE" }
                     .flatMap { f -> f.arr("files")?.mapNotNull { it as? JsonObject } ?: emptyList() }
                     .map { f ->
+                        val exportPath = f.str("export_path")?.nfc()
                         FileMeta(
                             id = f.str("id") ?: "",
                             name = f.str("file_name") ?: "",
                             size = f.long("file_size") ?: 0L,
                             isImage = f.bool("is_image"),
+                            localPath = exportPath?.let { imagePaths[it] },
                         )
                     }
-                messages += ChatMessage(
-                    id = msgId, role = "user", createdAt = insertedAt,
-                    content = content, files = files, status = "done",
-                )
+                ChatMessage(localId, "user", insertedAt, content = content, files = files, status = "done")
             } else {
                 val blocks = ArrayList<ReplyBlock>()
                 for (f in fragments) {
                     when (f.str("type")) {
-                        "THINK" -> blocks += ReplyBlock.Thinking(
-                            thinking = f.str("content") ?: "",
-                            startedAt = null,
-                            endedAt = null,
-                        ).let { t ->
-                            // 用 elapsed_secs 还原用时展示
-                            val secs = f["elapsed_secs"]?.takeIf { it !is kotlinx.serialization.json.JsonNull }
-                                ?.jsonPrimitive?.content?.toDoubleOrNull()
-                            if (secs != null) t.copy(startedAt = 0L, endedAt = (secs * 1000).toLong()) else t
+                        "THINK" -> {
+                            val secs = f["elapsed_secs"]?.takeIf { it !is JsonNull }?.jsonPrimitive?.content?.toDoubleOrNull()
+                            blocks += ReplyBlock.Thinking(
+                                thinking = f.str("content") ?: "",
+                                startedAt = if (secs != null) 0L else null,
+                                endedAt = if (secs != null) (secs * 1000).toLong() else null,
+                            )
                         }
                         "RESPONSE" -> blocks += ReplyBlock.Text(f.str("content") ?: "")
                         "TEMPLATE_RESPONSE" -> blocks += ReplyBlock.Text(f.str("content") ?: "", isTemplate = true)
                         "TOOL_SEARCH" -> {
                             val results = f.arr("results")?.mapNotNull { it as? JsonObject }?.map { r ->
-                                SearchResult(
-                                    url = r.str("url") ?: "",
-                                    title = r.str("title") ?: "",
-                                    snippet = r.str("snippet") ?: "",
-                                    siteName = r.str("site_name"),
-                                )
+                                SearchResult(r.str("url") ?: "", r.str("title") ?: "", r.str("snippet") ?: "", r.str("site_name"))
                             } ?: emptyList()
                             blocks += ReplyBlock.Search(
-                                queries = f.arr("queries")?.mapNotNull { it.jsonPrimitive.content } ?: emptyList(),
+                                queries = f.arr("queries")?.mapNotNull { runCatching { it.jsonPrimitive.content }.getOrNull() } ?: emptyList(),
                                 results = results,
                                 status = f.str("status") ?: "FINISHED",
                             )
                         }
-                        // TIP / CONTENT_RISK / PARTIAL_FILE_READ / TOOL_OPEN / TOOL_FIND / READ_LINK /
-                        // TOOL_IMAGE_SEARCH：无对应展示或 v1 不回传，丢弃
                     }
                 }
                 val status = when (m.str("status")) {
@@ -217,27 +242,52 @@ object HistoryArchive {
                     "CONTENT_FILTER" -> "refusal"
                     else -> "error"
                 }
-                messages += ChatMessage(
-                    id = msgId, role = "assistant", createdAt = insertedAt,
-                    blocks = blocks, status = status,
+                ChatMessage(
+                    localId, "assistant", insertedAt, blocks = blocks, status = status,
                     stopReason = if (status == "refusal") "refusal" else null,
-                    thinking = m.bool("thinking_enabled"),
-                    search = m.bool("search_enabled"),
+                    thinking = m.bool("thinking_enabled"), search = m.bool("search_enabled"),
                     errorText = if (status == "error") "历史回复生成失败" else null,
                 )
             }
+            val node = Node(local.copy(parentId = parent?.local?.id), aid, pid)
+            nodes += node
+            byArchive[aid] = node
         }
+        if (nodes.isEmpty()) throw ArchiveException("文件内容不完整，无法导入")
 
+        // 默认选中 id 最大的子消息（sorted 顺序遍历自然覆盖）
+        val selected = HashMap<String, String?>()
+        for (n in nodes) {
+            if (n.parentArchiveId != null) {
+                val p = byArchive[n.parentArchiveId]!!
+                selected[p.local.id] = n.local.id
+            }
+        }
+        // current_message_id 路径覆盖
+        val currentId = obj.int("current_message_id")
+        var current = currentId?.let { byArchive[it] } ?: throw ArchiveException("文件中的消息分支已损坏，无法导入")
+        selected[current.local.id] = null
+        while (current.parentArchiveId != null) {
+            val p = byArchive[current.parentArchiveId] ?: throw ArchiveException("文件中的消息分支已损坏，无法导入")
+            selected[p.local.id] = current.local.id
+            current = p
+        }
+        val rootId = current.local.id
+
+        val messages = nodes.map { it.local.copy(selectedChildId = selected[it.local.id]) }
         val title = (obj.str("title") ?: indexTitle)?.takeIf { it.isNotBlank() }
             ?: messages.firstOrNull { it.role == "user" }?.content?.take(30)?.takeIf { it.isNotBlank() }
             ?: "新对话"
-        return Session(id = id, title = title, createdAt = createdAt, updatedAt = updatedAt, messages = messages)
+        return Session(id, title, parseIso(obj.str("inserted_at")), parseIso(obj.str("updated_at")), messages, rootId)
     }
 
     // ---------------------------------------------------------------- export
 
-    /** 导出为 ZIP v3；写入调用方提供的输出流（SAF），不包含 API Key 与设置 */
-    fun export(sessions: List<Session>, output: OutputStream) {
+    /**
+     * 导出完整消息树与当前分支；图片原件由 readImage 提供（无原件仅元数据）。
+     * 不含 API Key 与设置。
+     */
+    fun export(sessions: List<Session>, readImage: (FileMeta) -> ByteArray?, output: OutputStream) {
         ZipOutputStream(output.buffered()).use { zos ->
             fun putEntry(name: String, bytes: ByteArray) {
                 zos.putNextEntry(ZipEntry(name))
@@ -245,14 +295,107 @@ object HistoryArchive {
                 zos.closeEntry()
             }
 
-            putEntry("manifest.json", json.encodeToString(
-                JsonObject.serializer(),
-                buildJsonObject { put("export_format_version", VERSION) },
-            ).toByteArray())
+            putEntry("manifest.json", """{"export_format_version":$VERSION}""".toByteArray())
 
+            val imageEntries = LinkedHashMap<String, ByteArray>()
             val index = buildJsonArray {
-                for (s in sessions) {
-                    putEntry("chat_sessions/${s.id}.json", sessionToJson(s).toByteArray())
+                for (s0 in sessions) {
+                    val s = s0.normalized()
+                    val ordered = s.messages.sortedWith(compareBy({ it.createdAt }, { it.id }))
+                    val archiveId = HashMap<String, Int>()
+                    ordered.forEachIndexed { i, m -> archiveId[m.id] = i }
+                    val visible = s.visibleMessages()
+                    val currentArchiveId = visible.lastOrNull()?.let { archiveId[it.id] } ?: 0
+
+                    val obj = buildJsonObject {
+                        put("id", s.id)
+                        put("title", s.title.ifBlank { null as String? })
+                        put("pinned", false)
+                        put("current_message_id", currentArchiveId)
+                        put("inserted_at", iso(s.createdAt))
+                        put("updated_at", iso(s.updatedAt))
+                        putJsonArray("messages") {
+                            for (m in ordered) {
+                                addJsonObject {
+                                    put("id", archiveId[m.id])
+                                    put("parent_id", m.parentId?.let { archiveId[it] })
+                                    put("role", if (m.role == "user") "USER" else "ASSISTANT")
+                                    put("status", when {
+                                        m.role == "user" -> "FINISHED"
+                                        m.status == "refusal" || m.stopReason == "refusal" -> "CONTENT_FILTER"
+                                        m.status == "done" && m.stopReason == "max_tokens" -> "INCOMPLETE"
+                                        m.status == "done" -> "FINISHED"
+                                        m.status == "stopped" -> "INCOMPLETE"
+                                        m.status == "error" -> "FAILED"
+                                        else -> "WIP"
+                                    })
+                                    put("thinking_enabled", m.thinking)
+                                    put("search_enabled", m.search)
+                                    put("accumulated_token_usage", 0)
+                                    put("inserted_at", iso(m.createdAt))
+                                    putJsonArray("fragments") {
+                                        if (m.role == "user") {
+                                            if (m.files.isNotEmpty()) {
+                                                addJsonObject {
+                                                    put("type", "FILE")
+                                                    putJsonArray("files") {
+                                                        for (f in m.files) {
+                                                            val bytes = if (f.isImage) readImage(f) else null
+                                                            val exportPath = if (bytes != null) {
+                                                                val p = "chat_sessions/${s.id}_files/${f.id}_${f.name.replace(Regex("[/\\\\]"), "_")}"
+                                                                imageEntries.putIfAbsent(p, bytes)
+                                                                p
+                                                            } else null
+                                                            addJsonObject {
+                                                                put("id", f.id)
+                                                                put("file_name", f.name)
+                                                                put("file_size", f.size)
+                                                                put("token_usage", null as Int?)
+                                                                put("inserted_at", iso(m.createdAt))
+                                                                put("export_path", exportPath)
+                                                                put("is_image", f.isImage)
+                                                                put("width", null as Int?)
+                                                                put("height", null as Int?)
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            addJsonObject { put("type", "REQUEST"); put("content", m.content) }
+                                        } else {
+                                            for (b in m.blocks) {
+                                                when (b) {
+                                                    is ReplyBlock.Thinking -> addJsonObject {
+                                                        put("type", "THINK")
+                                                        put("content", b.thinking)
+                                                        put("elapsed_secs", if (b.startedAt != null && b.endedAt != null) ((b.endedAt - b.startedAt) / 1000.0).coerceAtLeast(0.0) else null)
+                                                    }
+                                                    is ReplyBlock.Text -> addJsonObject {
+                                                        put("type", if (b.isTemplate) "TEMPLATE_RESPONSE" else "RESPONSE")
+                                                        put("content", b.text)
+                                                    }
+                                                    is ReplyBlock.Search -> addJsonObject {
+                                                        put("type", "TOOL_SEARCH")
+                                                        putJsonArray("queries") { b.queries.forEach { add(it) } }
+                                                        put("status", b.status)
+                                                        putJsonArray("results") {
+                                                            for (r in b.results) {
+                                                                addJsonObject {
+                                                                    put("url", r.url); put("title", r.title); put("snippet", r.snippet)
+                                                                    put("published_at", null as String?); put("site_name", r.siteName)
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    putEntry("chat_sessions/${s.id}.json", json.encodeToString(JsonObject.serializer(), obj).toByteArray())
                     addJsonObject {
                         put("id", s.id)
                         put("title", s.title.ifBlank { null as String? })
@@ -264,99 +407,8 @@ object HistoryArchive {
                 }
             }
             putEntry("chat_session_index.json", json.encodeToString(JsonArray.serializer(), index).toByteArray())
+            for ((name, bytes) in imageEntries) putEntry(name, bytes)
         }
-    }
-
-    private fun sessionToJson(s: Session): String {
-        val obj = buildJsonObject {
-            put("id", s.id)
-            put("title", s.title.ifBlank { null as String? })
-            put("pinned", false)
-            put("current_message_id", (s.messages.size - 1).coerceAtLeast(0))
-            put("inserted_at", iso(s.createdAt))
-            put("updated_at", iso(s.updatedAt))
-            putJsonArray("messages") {
-                for ((i, m) in s.messages.withIndex()) {
-                    addJsonObject {
-                        put("id", i)
-                        put("parent_id", if (i == 0) null as Int? else i - 1)
-                        put("role", if (m.role == "user") "USER" else "ASSISTANT")
-                        put("status", when {
-                            m.role == "user" -> "FINISHED"
-                            m.status == "refusal" || m.stopReason == "refusal" -> "CONTENT_FILTER"
-                            m.status == "done" && m.stopReason == "max_tokens" -> "INCOMPLETE"
-                            m.status == "done" -> "FINISHED"
-                            m.status == "stopped" -> "INCOMPLETE"
-                            m.status == "error" -> "FAILED"
-                            else -> "WIP"
-                        })
-                        put("thinking_enabled", m.thinking)
-                        put("search_enabled", m.search)
-                        put("accumulated_token_usage", 0)
-                        put("inserted_at", iso(m.createdAt))
-                        putJsonArray("fragments") {
-                            if (m.role == "user") {
-                                if (m.files.isNotEmpty()) {
-                                    addJsonObject {
-                                        put("type", "FILE")
-                                        putJsonArray("files") {
-                                            for (f in m.files) {
-                                                addJsonObject {
-                                                    put("id", f.id)
-                                                    put("file_name", f.name)
-                                                    put("file_size", f.size)
-                                                    put("token_usage", null as Int?)
-                                                    put("inserted_at", iso(m.createdAt))
-                                                    put("export_path", null as String?)
-                                                    put("is_image", f.isImage)
-                                                    put("width", null as Int?)
-                                                    put("height", null as Int?)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                addJsonObject { put("type", "REQUEST"); put("content", m.content) }
-                            } else {
-                                for (b in m.blocks) {
-                                    when (b) {
-                                        is ReplyBlock.Thinking -> addJsonObject {
-                                            put("type", "THINK")
-                                            put("content", b.thinking)
-                                            val secs = if (b.startedAt != null && b.endedAt != null) {
-                                                ((b.endedAt - b.startedAt) / 1000.0).coerceAtLeast(0.0)
-                                            } else null
-                                            put("elapsed_secs", secs)
-                                        }
-                                        is ReplyBlock.Text -> addJsonObject {
-                                            put("type", if (b.isTemplate) "TEMPLATE_RESPONSE" else "RESPONSE")
-                                            put("content", b.text)
-                                        }
-                                        is ReplyBlock.Search -> addJsonObject {
-                                            put("type", "TOOL_SEARCH")
-                                            putJsonArray("queries") { b.queries.forEach { add(it) } }
-                                            put("status", b.status)
-                                            putJsonArray("results") {
-                                                for (r in b.results) {
-                                                    addJsonObject {
-                                                        put("url", r.url)
-                                                        put("title", r.title)
-                                                        put("snippet", r.snippet)
-                                                        put("published_at", null as String?)
-                                                        put("site_name", r.siteName)
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return json.encodeToString(JsonObject.serializer(), obj)
     }
 
     fun exportFileName(now: Date = Date()): String =

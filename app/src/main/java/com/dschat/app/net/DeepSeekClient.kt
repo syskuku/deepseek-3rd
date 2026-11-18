@@ -11,6 +11,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -98,6 +99,31 @@ object DeepSeekClient {
         executeChecked(request)
     }
 
+    /**
+     * POST /anthropic/v1/files 上传附件，返回 file_id。
+     * purpose 必须排在 file 之前；图片不传 purpose。对照官方 uploadFile。
+     */
+    suspend fun uploadFile(apiKey: String, name: String, mimeType: String, purpose: String?, bytes: ByteArray): String {
+        val form = MultipartBody.Builder().setType(MultipartBody.FORM)
+        if (purpose != null) form.addFormDataPart("purpose", purpose)
+        form.addFormDataPart(
+            "file", name,
+            bytes.toRequestBody((mimeType.ifBlank { "application/octet-stream" }).toMediaType()),
+        )
+        val request = Request.Builder()
+            .url("$ANTHROPIC_BASE/files")
+            .header("x-api-key", apiKey)
+            .header("anthropic-beta", "files-api-2025-04-14")
+            .post(form.build())
+            .build()
+        val response = executeChecked(request)
+        val text = response.use { it.body?.string() ?: "" }
+        val obj = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull()
+            ?: throw ApiError(ApiErrorKind.PROTOCOL, "上传响应无效")
+        return obj["id"]?.jsonPrimitive?.content
+            ?: throw ApiError(ApiErrorKind.PROTOCOL, "上传响应缺少 file_id")
+    }
+
     private suspend fun executeChecked(request: Request): okhttp3.Response =
         suspendCancellableCoroutine { cont ->
             val call = client.newCall(request)
@@ -122,13 +148,15 @@ object DeepSeekClient {
             })
         }
 
-    /** POST /anthropic/v1/messages（stream: true），逐个产出流式事件，收到 message_stop 时结束 */
-    fun streamMessage(apiKey: String, body: JsonObject): Flow<StreamEvent> = flow {
-        val request = Request.Builder()
+    /** POST /anthropic/v1/messages（stream: true）；引用 Files API 文件时携带 beta 头 */
+    fun streamMessage(apiKey: String, body: JsonObject, hasFiles: Boolean = false): Flow<StreamEvent> = flow {
+        val builder = Request.Builder()
             .url("$ANTHROPIC_BASE/messages")
             .header("x-api-key", apiKey)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
+        if (hasFiles) builder.header("anthropic-beta", "files-api-2025-04-14")
+        val request = builder
             .post(json.encodeToString(JsonObject.serializer(), body).toRequestBody("application/json".toMediaType()))
             .build()
 

@@ -30,6 +30,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // 仅 debug 包：自动化测试旁路（adb am start --ez bypass_key true），release 无此入口
+        if (BuildConfig.DEBUG && intent.getBooleanExtra("bypass_key", false)) {
+            (application as DeepSeekApp).settings.apiKey = "sk-debug-bypass"
+        }
         setContent {
             val vm: ChatViewModel = viewModel()
             val theme by vm.theme.collectAsState()
