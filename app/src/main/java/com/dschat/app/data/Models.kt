@@ -138,6 +138,26 @@ data class Session(
     }
 
     /**
+     * 修复损坏的消息树（如旧版本写入的孤儿回复/同角色父子节点）：
+     * 检测到非法结构时按创建时间重建线性链；合法树（含导入的分支树）原样保留。
+     */
+    fun repaired(): Session {
+        val byId = messages.associateBy { it.id }
+        val broken = messages.any { m ->
+            val p = m.parentId?.let { byId[it] }
+            (m.parentId != null && p == null) ||
+                (p != null && p.role == m.role) ||
+                (m.role == "assistant" && m.parentId == null)
+        } || (rootMessageId != null && byId[rootMessageId] == null)
+        if (!broken) return this
+        val ordered = messages.sortedBy { it.createdAt }
+        val linked = ordered.mapIndexed { i, m ->
+            m.copy(parentId = ordered.getOrNull(i - 1)?.id, selectedChildId = ordered.getOrNull(i + 1)?.id)
+        }
+        return copy(messages = linked, rootMessageId = linked.firstOrNull()?.id)
+    }
+
+    /**
      * 追加一轮「提问 + 回复」并正确链接分支（官方 appendBranch 语义）：
      * 提问挂在当前路径末尾节点下，回复挂在提问下且被提问选中。
      * 缺少任何一条链接都会导致回复不可见或后续提问错误分叉。

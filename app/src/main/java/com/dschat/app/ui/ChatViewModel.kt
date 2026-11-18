@@ -126,7 +126,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun openSession(id: String) {
         viewModelScope.launch {
-            val session = store.load(id)?.normalized()
+            val session = store.load(id)?.normalized()?.repaired()
             if (session == null) {
                 toast("对话加载失败，请重试")
                 _sessions.value = store.listMetas()

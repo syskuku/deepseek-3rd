@@ -226,6 +226,37 @@ class SessionTreeTest {
     }
 
     @Test
+    fun repairsCorruptedLegacyTree() {
+        // 模拟 v0.2.0 损坏数据：回复孤儿（parent=null）、第二轮提问错挂到第一问下
+        val t = 1000L
+        val corrupted = Session(
+            "s", "", t, t + 3,
+            listOf(
+                ChatMessage("u1", "user", t, content = "q1", selectedChildId = null),
+                ChatMessage("a1", "assistant", t + 1, blocks = listOf(ReplyBlock.Text("r1")), parentId = null),
+                ChatMessage("u2", "user", t + 2, content = "q2", parentId = "u1"),
+                ChatMessage("a2", "assistant", t + 3, blocks = listOf(ReplyBlock.Text("r2")), parentId = null),
+            ),
+            rootMessageId = "u1",
+        )
+        val fixed = corrupted.repaired()
+        assertEquals(listOf("u1", "a1", "u2", "a2"), fixed.visibleMessages().map { it.id })
+        assertEquals("u1", fixed.messages.first { it.id == "a1" }.parentId)
+        assertEquals("a1", fixed.messages.first { it.id == "u2" }.parentId)
+        // 合法分支树不被改动
+        val valid = Session(
+            "s", "", t, t,
+            listOf(
+                ChatMessage("u", "user", t, content = "q", selectedChildId = "a2"),
+                ChatMessage("a1", "assistant", t + 1, blocks = listOf(ReplyBlock.Text("v1")), parentId = "u"),
+                ChatMessage("a2", "assistant", t + 2, blocks = listOf(ReplyBlock.Text("v2")), parentId = "u"),
+            ),
+            rootMessageId = "u",
+        )
+        assertEquals(valid, valid.repaired())
+    }
+
+    @Test
     fun normalizeLinearSession() {
         val t = 1000L
         val s = Session(
