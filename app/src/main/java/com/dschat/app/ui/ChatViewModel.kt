@@ -709,7 +709,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             _updateProgress.value = 0f
             _updateError.value = null
             try {
-                val file = UpdateChecker.download(context.applicationContext, info.apkUrl) { p ->
+                val file = UpdateChecker.download(context.applicationContext, info) { p ->
                     _updateProgress.value = p
                 }
                 _downloadedApk.value = file

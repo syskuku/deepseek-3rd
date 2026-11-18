@@ -29,6 +29,8 @@ object UpdateChecker {
         val notes: String,
         val apkUrl: String,
         val apkSize: Long,
+        /** 云直链被 CDN 人机验证拦截时的 GitHub 兜底下载地址 */
+        val fallbackUrl: String? = null,
     )
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -57,6 +59,7 @@ object UpdateChecker {
                 notes = obj["notes"]?.jsonPrimitive?.content ?: "",
                 apkUrl = url,
                 apkSize = obj["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
+                fallbackUrl = "https://github.com/syskuku/deepseek-3rd/releases/download/v$version/DeepSeek-3rd-v$version.apk",
             )
         }
     } catch (_: Exception) {
@@ -97,18 +100,24 @@ object UpdateChecker {
     }
 
     /** 下载 APK 到 cacheDir/update.apk，直连失败尝试镜像；onProgress 0..1 */
-    suspend fun download(context: Context, url: String, onProgress: (Float) -> Unit): File =
+    /** 下载 APK：先试主地址（云），失败降级 GitHub 及其镜像；onProgress 0..1 */
+    suspend fun download(context: Context, info: UpdateInfo, onProgress: (Float) -> Unit): File =
         withContext(Dispatchers.IO) {
-            // 云直链境内可达无需镜像；GitHub 直链失败时尝试镜像代理
-            val mirrors = if (url.contains("github.com")) {
-                listOf(url, "https://gh-proxy.com/$url", "https://ghfast.top/$url")
-            } else {
-                listOf(url)
+            val candidates = ArrayList<String>()
+            candidates += info.apkUrl
+            if (info.apkUrl.contains("github.com")) {
+                candidates += "https://gh-proxy.com/${info.apkUrl}"
+                candidates += "https://ghfast.top/${info.apkUrl}"
+            } else if (info.fallbackUrl != null) {
+                // 云直链可能被 CDN 人机验证拦截，降级到 GitHub 直链与镜像
+                candidates += info.fallbackUrl
+                candidates += "https://gh-proxy.com/${info.fallbackUrl}"
+                candidates += "https://ghfast.top/${info.fallbackUrl}"
             }
             var lastError: Exception? = null
-            for (mirror in mirrors) {
+            for (candidate in candidates) {
                 try {
-                    return@withContext downloadFrom(context, mirror, onProgress)
+                    return@withContext downloadFrom(context, candidate, onProgress)
                 } catch (e: IOException) {
                     lastError = e
                 }
@@ -117,7 +126,9 @@ object UpdateChecker {
         }
 
     private fun downloadFrom(context: Context, url: String, onProgress: (Float) -> Unit): File {
-        val request = Request.Builder().url(url).get().build()
+        val request = Request.Builder().url(url)
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
+            .get().build()
         val dest = File(context.cacheDir, "update.apk")
         val tmp = File(context.cacheDir, "update.apk.tmp")
         client.newCall(request).execute().use { resp ->
