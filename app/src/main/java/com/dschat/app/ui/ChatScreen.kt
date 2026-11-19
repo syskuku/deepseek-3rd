@@ -311,7 +311,10 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
     // 底部锁定：默认锁定；仅用户亲自上滑才解锁；发送新消息重新锁定
     var bottomLocked by remember { mutableStateOf(true) }
     val isAtBottom by remember { derivedStateOf { !listState.canScrollForward } }
-    val lastTick = messages.lastOrNull()?.let { it.blocks.size * 100000 + it.replyText.length } ?: 0
+    val lastTick = messages.lastOrNull()?.let { m ->
+        m.blocks.size * 100000 + m.replyText.length +
+            m.blocks.sumOf { if (it is com.dschat.app.data.ReplyBlock.Thinking) it.thinking.length else 0 }
+    } ?: 0
 
     // 用户上滑（离开底部）→ 解锁；回到底部不自动重锁（需发送或点箭头）
     LaunchedEffect(isAtBottom) {
