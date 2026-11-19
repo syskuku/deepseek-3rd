@@ -15,12 +15,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -109,10 +112,11 @@ fun BranchSwitcher(
     }
 }
 
-/** 附件展示：图片缩略图 / 文档卡片 */
+/** 附件展示：图片缩略图（点击看长图）/ 文档卡片 */
 @Composable
 fun AttachmentRow(message: ChatMessage, fileOf: (String) -> File) {
     val ds = LocalDsColors.current
+    var viewing by remember { mutableStateOf<String?>(null) }
     if (message.files.isEmpty()) return
     Row(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -127,7 +131,8 @@ fun AttachmentRow(message: ChatMessage, fileOf: (String) -> File) {
                     modifier = Modifier
                         .size(64.dp)
                         .clip(RoundedCornerShape(16.dp))
-                        .background(ds.tag),
+                        .background(ds.tag)
+                        .clickable { viewing = f.localPath },
                 )
             } else {
                 Row(
@@ -149,6 +154,34 @@ fun AttachmentRow(message: ChatMessage, fileOf: (String) -> File) {
                         )
                         Text(AttachmentRules.formatSize(f.size), fontSize = 10.sp, color = ds.labelTertiary)
                     }
+                }
+            }
+        }
+    }
+
+    // 长图全屏可滚动查看（限制解码尺寸，避免超长图超出纹理上限崩溃）
+    viewing?.let { path ->
+        val ctx = androidx.compose.ui.platform.LocalContext.current
+        val request = remember(path) {
+            coil.request.ImageRequest.Builder(ctx)
+                .data(fileOf(path))
+                .size(coil.size.Size(1080, 4096))
+                .crossfade(true)
+                .build()
+        }
+        androidx.compose.ui.window.Dialog(onDismissRequest = { viewing = null }) {
+            androidx.compose.material3.Surface(
+                color = ds.bgBase,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp),
+            ) {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState()).padding(8.dp)) {
+                    AsyncImage(
+                        model = request,
+                        contentDescription = null,
+                        contentScale = ContentScale.FillWidth,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)),
+                    )
                 }
             }
         }

@@ -22,7 +22,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Upload
@@ -82,6 +84,20 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                 try {
                     context.contentResolver.openOutputStream(uri)?.use { out -> vm.exportArchive(out) }
                     vm.toast("导出成功")
+                } catch (e: Exception) {
+                    vm.toast("导出失败：${e.message ?: "未知错误"}")
+                }
+            }
+        }
+    }
+    val logLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                try {
+                    com.dschat.app.util.FeedbackHelper.exportLog(context, uri)
+                    vm.toast("日志已导出")
                 } catch (e: Exception) {
                     vm.toast("导出失败：${e.message ?: "未知错误"}")
                 }
@@ -190,8 +206,27 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                 Icon(Icons.Filled.DeleteOutline, null, tint = ds.error, modifier = Modifier.size(18.dp))
             }
 
+            SectionTitle("帮助与反馈")
+            SettingRow(
+                title = "问题反馈（一键邮件）",
+                subtitle = "遇到问题？自动附日志发送邮件给维护者",
+                onClick = {
+                    runCatching { com.dschat.app.util.FeedbackHelper.emailFeedback(context) }
+                        .onFailure { vm.toast("无法打开邮件应用：${it.message}") }
+                },
+            ) {
+                Icon(Icons.Filled.Email, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
+            }
+            SettingRow(
+                title = "导出日志",
+                subtitle = "保存应用日志与设备信息到文件",
+                onClick = { logLauncher.launch("deepseek3rd-log.txt") },
+            ) {
+                Icon(Icons.Filled.Description, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
+            }
+
             SectionTitle("关于与开源许可")
-            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.3.2 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.3.5 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
             SettingRow(
                 title = "检查更新",
                 subtitle = "优先国内云，GitHub 兜底",

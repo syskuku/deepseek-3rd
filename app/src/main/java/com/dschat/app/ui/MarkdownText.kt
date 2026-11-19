@@ -45,20 +45,28 @@ fun MarkdownText(
             if (view.tag != markdown) {
                 view.tag = markdown
                 markwon(view.context, textSizeSp).setMarkdown(view, normalizeMath(markdown))
+                alignMathBaseline(view.text)
             }
         },
     )
 }
 
-/**
- * Markwon ext-latex 仅识别 $$...$$；官方 demo 支持单 $...$。
- * 这里把单 $ 行内公式升级为 $$（跳过含首尾空格的金额写法，如 "$5 and $10"）。
- */
-private fun normalizeMath(md: String): String =
-    Regex("(?<!\\$)\\$(?!\\$)([^$\\n]+?)(?<!\\$)\\$(?!\\$)").replace(md) { m ->
-        val inner = m.groupValues[1]
-        if (inner.startsWith(" ") || inner.endsWith(" ")) m.value else "\$\$$inner\$\$"
+/** 公式适配委托给纯逻辑 MathNormalizer（定界符转换 + 颜色命令映射），便于单元测试。 */
+private fun normalizeMath(md: String): String = MathNormalizer.normalize(md)
+
+/** 行内公式默认 ALIGN_BOTTOM 显得偏下，反射改为 ALIGN_BASELINE 与文字基线对齐。 */
+private fun alignMathBaseline(text: CharSequence) {
+    if (text !is android.text.Spanned) return
+    val spans = text.getSpans(0, text.length, io.noties.markwon.image.AsyncDrawableSpan::class.java)
+    if (spans.isEmpty()) return
+    try {
+        val f = io.noties.markwon.image.AsyncDrawableSpan::class.java.getDeclaredField("alignment")
+        f.isAccessible = true
+        for (s in spans) runCatching { f.setInt(s, io.noties.markwon.image.AsyncDrawableSpan.ALIGN_BASELINE) }
+    } catch (_: Throwable) {
+        // 反射失败则保持默认对齐，不影响渲染
     }
+}
 
 private var cached: Markwon? = null
 private var cachedContext: Context? = null
