@@ -428,10 +428,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         streamJob?.cancel()
     }
 
-    /** 发送前补传缺少 serverId 的本地原件（官方：导入附件首次用于请求时上传） */
-    private suspend fun ensureUploaded(session: Session): Session {
+    /** 发送前补传缺少 serverId 的本地原件（仅处理本次上下文范围内的消息，避免大会话全量补传） */
+    private suspend fun ensureUploaded(session: Session, scope: List<ChatMessage>): Session {
         var result = session
-        val targets = result.visibleMessages().filter { it.role == "user" && it.files.any { f -> f.serverId == null && f.localPath != null } }
+        val targets = scope.filter { it.role == "user" && it.files.any { f -> f.serverId == null && f.localPath != null } }
         for (m in targets) {
             val updatedFiles = m.files.toMutableList()
             for ((i, f) in updatedFiles.withIndex()) {
@@ -494,12 +494,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 while (!finished) {
                     try {
-                        // 补传附件（含历史轮次缺失的 serverId）
-                        currentBase = ensureUploaded(currentBase)
-                        _active.value = currentBase
+                        // 截断上下文到模型窗口预算，避免超长大会话（如数百轮）直接 400
                         val visible = currentBase.visibleMessages()
-                        val history = visible.dropLast(2)
                         val liveQuestion = visible.find { it.id == question.id } ?: question
+                        val history = RequestBuilder.trimHistory(visible.dropLast(2))
+                        // 仅补传本次上下文范围内的附件
+                        currentBase = ensureUploaded(currentBase, history + liveQuestion)
+                        _active.value = currentBase
                         val messages = RequestBuilder.toRequestMessages(history, liveQuestion, prefix, reply.thinking)
                         val hasFiles = RequestBuilder.hasFileBlocks(history, liveQuestion)
                         val body = RequestBuilder.buildBody(messages, reply.thinking, reply.search, requestTitle && currentBase.title.isBlank())

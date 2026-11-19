@@ -167,4 +167,39 @@ object RequestBuilder {
         if (requestTitle) putJsonObject("title") { put("enabled", true) }
         put("stream", true)
     }
+
+    /** 单条消息的上下文成本估算（中文约 1 字≈1 token；图片按固定开销计） */
+    private fun contextCost(m: ChatMessage): Int {
+        val text = if (m.role == "user") m.content.length else m.replyText.length
+        val files = m.files.count { it.serverId != null || it.localPath != null } * 1500
+        return text + files + 16
+    }
+
+    /**
+     * 截断历史到模型上下文预算：从最近一轮往前保留完整「提问+回答」轮次，
+     * 超出预算即停止（至少保留最近一轮）。避免数百轮大会话直接超出上下文窗口报 400。
+     */
+    fun trimHistory(history: List<ChatMessage>, budgetChars: Int = 100_000): List<ChatMessage> {
+        if (history.isEmpty()) return history
+        val rounds = ArrayList<List<ChatMessage>>()
+        var i = history.size
+        while (i > 0) {
+            var j = i
+            while (j > 0 && history[j - 1].role == "assistant") j--
+            if (j > 0 && history[j - 1].role == "user") j--
+            if (j == i) j = i - 1
+            rounds.add(history.subList(j, i))
+            i = j
+        }
+        val kept = ArrayList<List<ChatMessage>>()
+        var cost = 0
+        for (r in rounds) { // rounds 为最近优先
+            val c = r.sumOf { contextCost(it) }
+            if (kept.isNotEmpty() && cost + c > budgetChars) break
+            kept.add(r)
+            cost += c
+        }
+        kept.reverse()
+        return kept.flatten()
+    }
 }

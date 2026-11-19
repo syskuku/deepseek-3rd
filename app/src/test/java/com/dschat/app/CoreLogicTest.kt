@@ -348,6 +348,25 @@ class RequestBuilderTest {
         assertNotNull(body["title"])
         assertEquals(true, body["stream"]!!.jsonPrimitive.content.toBoolean())
     }
+
+    @Test
+    fun trimHistoryKeepsRecentRoundsWithinBudget() {
+        val t = 1000L
+        val history = ArrayList<ChatMessage>()
+        for (r in 0 until 200) {
+            history.add(ChatMessage("u$r", "user", t + r * 2, content = "问".repeat(1000)))
+            history.add(ChatMessage("a$r", "assistant", t + r * 2 + 1, blocks = listOf(ReplyBlock.Text("答".repeat(1000)))))
+        }
+        val trimmed = RequestBuilder.trimHistory(history, budgetChars = 20_000)
+        // 每轮约 2016 字符，20000 预算约保留 9 轮=18 条
+        assertTrue(trimmed.size < history.size)
+        assertTrue(trimmed.size <= 20)
+        // 保留的是最近的轮次
+        assertEquals("a199", trimmed.last().id)
+        // 完整轮次（成对）
+        assertEquals(0, trimmed.size % 2)
+        assertEquals("u191", trimmed.first().id)
+    }
 }
 
 class AttachmentRulesTest {
