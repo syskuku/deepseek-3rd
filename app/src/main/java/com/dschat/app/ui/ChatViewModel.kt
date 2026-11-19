@@ -438,16 +438,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 if (f.serverId != null || f.localPath == null) continue
                 val file = store.attachmentFile(f.localPath)
                 if (!file.exists()) { updatedFiles[i] = f.copy(localPath = null); continue }
-                val bytes = withContext(Dispatchers.IO) { file.readBytes() }
+                val raw = withContext(Dispatchers.IO) { file.readBytes() }
+                // 超大/超长图先缩到 ≤4096，避免模型报 unsupported image
+                val (bytes, mime) = if (f.isImage) com.dschat.app.util.ImageResize.maybeShrink(raw, f.mimeType) else raw to f.mimeType
                 val serverId = try {
                     DeepSeekClient.uploadFile(
-                        settings.apiKey ?: "", f.name, f.mimeType,
+                        settings.apiKey ?: "", f.name, mime,
                         AttachmentRules.purposeOf(f.name, f.isImage), bytes,
                     )
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
-                    // 个别图片上传失败（格式/尺寸/服务侧拒绝）：跳过该图，不阻断整次发送
                     null
                 }
                 updatedFiles[i] = if (serverId != null) f.copy(serverId = serverId) else f.copy(localPath = null, serverId = null)

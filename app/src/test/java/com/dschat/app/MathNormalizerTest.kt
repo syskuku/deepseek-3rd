@@ -75,4 +75,31 @@ class MathNormalizerTest {
         val out = MathNormalizer.normalize("\\(\\textcolor[HTML]{FF8800}{w}\\)")
         assertTrue(out.contains("\\fgcolor{FF8800}{w}"))
     }
+
+    @Test
+    fun bareFcolorboxLineWrappedAndMapped() {
+        val out = MathNormalizer.normalize("\\fcolorbox{#8B6FA8}{#FBEDE9}{\\scalebox{0.8}{x}}")
+        assertTrue("wrapped in \$\$", out.contains("\$\$"))
+        assertTrue("mapped to bgcolor/fgcolor", out.contains("\\bgcolor{FBEDE9}{\\fgcolor{8B6FA8}"))
+        assertTrue("scalebox kept", out.contains("\\scalebox{0.8}{x}"))
+    }
+
+    @Test
+    fun bareBgcolorLineWrapped() {
+        val out = MathNormalizer.normalize("\\bgcolor{FBF8F1}{\\fgcolor{6FA698}{\\scalebox{0.8}{y}}}")
+        assertTrue(out.contains("\$\$\\bgcolor{FBF8F1}{\\fgcolor{6FA698}"))
+    }
+
+    @Test
+    fun chineseProseNotWrapped() {
+        val out = MathNormalizer.normalize("这是中文说明，含 \\frac 命令但不包裹")
+        assertTrue(!out.contains("\$\$"))
+    }
+
+    @Test
+    fun trailingDollarNotDoubled() {
+        val out = MathNormalizer.normalize("\\frac{a}{b} \$\$")
+        assertEquals("\$\$\\frac{a}{b}\$\$", out)
+        assertTrue(!out.contains("\$\$\$\$"))
+    }
 }

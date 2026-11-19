@@ -21,6 +21,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.dschat.app.ui.ApiKeyScreen
 import com.dschat.app.ui.ChatScreen
 import com.dschat.app.ui.ChatViewModel
+import com.dschat.app.ui.FeedbackTipScreen
 import com.dschat.app.ui.ImportOnboardingScreen
 import com.dschat.app.ui.SettingsScreen
 import com.dschat.app.ui.UpdateDialog
@@ -31,9 +32,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        // 仅 debug 包：自动化测试旁路（adb am start --ez bypass_key true），release 无此入口
+        // 仅 debug 包且本机尚未配置 Key 时才用测试旁路；绝不覆盖用户已填的真实 Key
         if (BuildConfig.DEBUG && intent.getBooleanExtra("bypass_key", false)) {
-            (application as DeepSeekApp).settings.apiKey = "sk-debug-bypass"
+            val s = (application as DeepSeekApp).settings
+            if (s.apiKey.isNullOrBlank()) s.apiKey = "sk-debug-bypass"
         }
         setContent {
             val vm: ChatViewModel = viewModel()
@@ -42,6 +44,7 @@ class MainActivity : ComponentActivity() {
             var showSettings by remember { mutableStateOf(false) }
             val settings = (application as DeepSeekApp).settings
             var showOnboarding by remember { mutableStateOf(hasKey && !settings.onboardingDone) }
+            var showFeedbackTip by remember { mutableStateOf(false) }
             val snackbar = remember { SnackbarHostState() }
 
             LaunchedEffect(Unit) {
@@ -70,8 +73,14 @@ class MainActivity : ComponentActivity() {
                             showOnboarding -> ImportOnboardingScreen(
                                 onImport = { link -> vm.importFromUrl(link) },
                                 onDone = {
-                                    settings.onboardingDone = true
                                     showOnboarding = false
+                                    showFeedbackTip = true
+                                },
+                            )
+                            showFeedbackTip -> FeedbackTipScreen(
+                                onDone = {
+                                    settings.onboardingDone = true
+                                    showFeedbackTip = false
                                 },
                             )
                             showSettings -> SettingsScreen(vm, onBack = { showSettings = false })

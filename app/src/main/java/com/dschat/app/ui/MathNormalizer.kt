@@ -17,7 +17,33 @@ object MathNormalizer {
             if (inner.startsWith(" ") || inner.endsWith(" ")) m.value else "\$\$$inner\$\$"
         }
         s = rewriteColorCommands(s)
+        s = wrapBareFormulaLines(s)
         return s
+    }
+
+    private val MATH_BLOCK = Regex("\$\$[\\s\\S]*?\$\$")
+    private val FORMULA_CMD = Regex("\\\\(fcolorbox|colorbox|textcolor|bgcolor|fgcolor|scalebox|boxed|frac|sqrt|sum|int|lim|begin|mathrm|mathbb|text|alpha|beta|gamma|theta|lambda|pi|sigma|omega|infty|partial|nabla|cdot|times|leq|geq|neq|approx|equiv|subset|cup|cap|forall|exists|rightarrow|leftarrow|Rightarrow|overline|underline|hat|bar|vec|dot)\\b")
+    private val CJK = Regex("[一-鿿]")
+
+    /** 模型有时输出不带定界符的裸公式行；把纯公式行包裹成 $$ 以便渲染（跳过已有 $$ 块与中文 prose） */
+    private fun wrapBareFormulaLines(s: String): String {
+        val sb = StringBuilder()
+        var last = 0
+        for (m in MATH_BLOCK.findAll(s)) {
+            sb.append(wrapPlain(s.substring(last, m.range.first)))
+            sb.append(m.value)
+            last = m.range.last + 1
+        }
+        sb.append(wrapPlain(s.substring(last)))
+        return sb.toString()
+    }
+
+    private fun wrapPlain(seg: String): String = seg.lines().joinToString("\n") { line ->
+        val t = line.trim()
+        if (t == "\$\$") return@joinToString line // 独立定界符行保持原样
+        // 去掉行内已有的首尾 $$，避免包裹后出现重复 $$ 漏在公式后
+        val core = t.removePrefix("\$\$").removeSuffix("\$\$").trim()
+        if (core.isNotEmpty() && FORMULA_CMD.containsMatchIn(core) && !CJK.containsMatchIn(core)) "\$\$$core\$\$" else line
     }
 
     private fun readCmd(s: String, i: Int): Pair<String, Int> {
