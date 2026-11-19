@@ -437,13 +437,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             for ((i, f) in updatedFiles.withIndex()) {
                 if (f.serverId != null || f.localPath == null) continue
                 val file = store.attachmentFile(f.localPath)
-                if (!file.exists()) continue
+                if (!file.exists()) { updatedFiles[i] = f.copy(localPath = null); continue }
                 val bytes = withContext(Dispatchers.IO) { file.readBytes() }
-                val serverId = DeepSeekClient.uploadFile(
-                    settings.apiKey ?: "", f.name, f.mimeType,
-                    AttachmentRules.purposeOf(f.name, f.isImage), bytes,
-                )
-                updatedFiles[i] = f.copy(serverId = serverId)
+                val serverId = try {
+                    DeepSeekClient.uploadFile(
+                        settings.apiKey ?: "", f.name, f.mimeType,
+                        AttachmentRules.purposeOf(f.name, f.isImage), bytes,
+                    )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // 个别图片上传失败（格式/尺寸/服务侧拒绝）：跳过该图，不阻断整次发送
+                    null
+                }
+                updatedFiles[i] = if (serverId != null) f.copy(serverId = serverId) else f.copy(localPath = null, serverId = null)
             }
             result = result.replaceMessage(m.copy(files = updatedFiles))
         }
@@ -494,11 +501,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 while (!finished) {
                     try {
-                        // 截断上下文到模型窗口预算，避免超长大会话（如数百轮）直接 400
+                        // 与官方 demo 一致：全量可用轮次进入上下文（不做截断）
                         val visible = currentBase.visibleMessages()
                         val liveQuestion = visible.find { it.id == question.id } ?: question
-                        val history = RequestBuilder.trimHistory(visible.dropLast(2))
-                        // 仅补传本次上下文范围内的附件
+                        val history = visible.dropLast(2)
+                        // 补传附件；个别图片上传失败时跳过该图，不阻断整次发送
                         currentBase = ensureUploaded(currentBase, history + liveQuestion)
                         _active.value = currentBase
                         val messages = RequestBuilder.toRequestMessages(history, liveQuestion, prefix, reply.thinking)

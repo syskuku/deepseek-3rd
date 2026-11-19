@@ -350,22 +350,17 @@ class RequestBuilderTest {
     }
 
     @Test
-    fun trimHistoryKeepsRecentRoundsWithinBudget() {
-        val t = 1000L
-        val history = ArrayList<ChatMessage>()
-        for (r in 0 until 200) {
-            history.add(ChatMessage("u$r", "user", t + r * 2, content = "问".repeat(1000)))
-            history.add(ChatMessage("a$r", "assistant", t + r * 2 + 1, blocks = listOf(ReplyBlock.Text("答".repeat(1000)))))
-        }
-        val trimmed = RequestBuilder.trimHistory(history, budgetChars = 20_000)
-        // 每轮约 2016 字符，20000 预算约保留 9 轮=18 条
-        assertTrue(trimmed.size < history.size)
-        assertTrue(trimmed.size <= 20)
-        // 保留的是最近的轮次
-        assertEquals("a199", trimmed.last().id)
-        // 完整轮次（成对）
-        assertEquals(0, trimmed.size % 2)
-        assertEquals("u191", trimmed.first().id)
+    fun droppedFileExcludedFromRequest() {
+        // 上传失败被丢弃的图片（localPath=null/serverId=null）不应进入请求
+        val q = ChatMessage(
+            "q", "user", 1L, content = "看图",
+            files = listOf(FileMeta("f", "a.png", 10, true, "image/png", null, null)),
+        )
+        val messages = RequestBuilder.toRequestMessages(emptyList(), q)
+        val content = messages.last().jsonObject["content"]
+        // 无有效文件时应为纯文本字符串
+        assertEquals("看图", content!!.jsonPrimitive.content)
+        assertTrue(!RequestBuilder.hasFileBlocks(emptyList(), q))
     }
 }
 
