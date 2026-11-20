@@ -19,6 +19,7 @@ import com.dschat.app.data.ReplyBlock
 import com.dschat.app.data.SearchResult
 import com.dschat.app.data.Session
 import com.dschat.app.data.SessionMeta
+import com.dschat.app.data.SessionJson
 import com.dschat.app.data.SessionStore
 import com.dschat.app.net.ApiCondition
 import com.dschat.app.net.ApiError
@@ -748,6 +749,45 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 附件原件文件（供缩略图加载） */
     fun attachmentFile(relPath: String): File = store.attachmentFile(relPath)
+
+    /** 导出单个对话为 JSON（含附件 base64） */
+    suspend fun exportSessionJson(id: String, output: OutputStream) = withContext(Dispatchers.IO) {
+        val session = store.load(id)?.normalized() ?: throw IllegalStateException("对话不存在")
+        val text = SessionJson.export(session) { p ->
+            val f = store.attachmentFile(p)
+            if (f.exists()) runCatching { f.readBytes() }.getOrNull() else null
+        }
+        output.write(text.toByteArray(Charsets.UTF_8))
+    }
+
+    /** 生成单个对话 JSON 缓存文件（供反馈邮件附件） */
+    suspend fun sessionJsonFile(id: String): File? = withContext(Dispatchers.IO) {
+        val session = store.load(id)?.normalized() ?: return@withContext null
+        val text = SessionJson.export(session) { p ->
+            val f = store.attachmentFile(p)
+            if (f.exists()) runCatching { f.readBytes() }.getOrNull() else null
+        }
+        val out = File(getApplication<DeepSeekApp>().cacheDir, "feedback-session-$id.json")
+        out.writeText(text)
+        out
+    }
+
+    /** 导入单个对话 JSON：合并为新会话（不覆盖现有），返回新会话 id */
+    suspend fun importSessionJson(openStream: () -> InputStream): String = withContext(Dispatchers.IO) {
+        _busy.value = true
+        try {
+            val text = openStream().bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val newId = SessionStore.newId()
+            val session = SessionJson.import(text, newId) { fid, name, bytes ->
+                store.saveAttachment(newId, fid, name, bytes)
+            }
+            store.save(session)
+            refreshMetas()
+            newId
+        } finally {
+            _busy.value = false
+        }
+    }
 
     // ------------------------------------------------------------ in-app update
 

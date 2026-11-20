@@ -8,6 +8,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -189,6 +190,7 @@ fun AttachmentRow(message: ChatMessage, fileOf: (String) -> File) {
 }
 
 /** 用户消息：右对齐气泡 + 附件 + 版本切换 + 点击编辑 */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun UserMessageView(
     message: ChatMessage,
@@ -198,6 +200,8 @@ fun UserMessageView(
     onEdit: () -> Unit,
 ) {
     val ds = LocalDsColors.current
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    val context = androidx.compose.ui.platform.LocalContext.current
     Column(
         modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
         horizontalAlignment = Alignment.End,
@@ -209,7 +213,13 @@ fun UserMessageView(
                 modifier = Modifier
                     .widthIn(max = 320.dp)
                     .background(ds.bubble, RoundedCornerShape(22.dp))
-                    .clickable(onClick = onEdit)
+                    .combinedClickable(
+                        onClick = onEdit,
+                        onLongClick = {
+                            clipboard.setText(androidx.compose.ui.text.AnnotatedString(message.content))
+                            android.widget.Toast.makeText(context, "已复制", android.widget.Toast.LENGTH_SHORT).show()
+                        },
+                    )
                     .padding(horizontal = 16.dp, vertical = 10.dp),
             ) {
                 Text(message.content, fontSize = 16.sp, lineHeight = 24.sp, color = ds.labelPrimary)

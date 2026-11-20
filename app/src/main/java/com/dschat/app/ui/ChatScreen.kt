@@ -298,6 +298,22 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
         if (uris.isNotEmpty()) vm.addDrafts(uris)
     }
 
+    // 导出单个对话 JSON
+    var exportJsonId by remember { mutableStateOf<String?>(null) }
+    val exportJsonPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        val id = exportJsonId
+        if (uri != null && id != null) {
+            scope.launch {
+                try {
+                    context.contentResolver.openOutputStream(uri)?.use { vm.exportSessionJson(id, it) }
+                    vm.toast("已导出单个对话 JSON")
+                } catch (e: Exception) {
+                    vm.toast("导出失败：${e.message ?: "未知错误"}")
+                }
+            }
+        }
+    }
+
     // 录音
     val recorder = remember { com.dschat.app.speech.VoiceRecorder() }
     var voiceError by remember { mutableStateOf<String?>(null) }
@@ -345,6 +361,7 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                     onOpen = { vm.openSession(it); scope.launch { drawerState.close() } },
                     onRename = vm::renameSession,
                     onDelete = vm::deleteSession,
+                    onExportJson = { id -> exportJsonId = id; exportJsonPicker.launch("deepseek-session.json") },
                     onSettings = { scope.launch { drawerState.close() }; onOpenSettings() },
                 )
             }

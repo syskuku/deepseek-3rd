@@ -43,16 +43,22 @@ object FeedbackHelper {
         return f
     }
 
-    /** 一键邮件反馈（附日志） */
-    fun emailFeedback(context: Context) {
+    /** 一键邮件反馈（附日志 + 可选勾选的问题会话 JSON） */
+    fun emailFeedback(context: Context, sessionFiles: List<File> = emptyList()) {
         val report = writeReport(context)
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", report)
-        val intent = Intent(Intent.ACTION_SEND).apply {
+        val files = listOf(report) + sessionFiles
+        val uris = ArrayList(files.map { FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", it) })
+        val intent = Intent(if (uris.size > 1) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND).apply {
             type = "message/rfc822"
             putExtra(Intent.EXTRA_EMAIL, arrayOf(FEEDBACK_EMAIL))
             putExtra(Intent.EXTRA_SUBJECT, "DeepSeek(3rd) 反馈 v${BuildConfig.VERSION_NAME}")
-            putExtra(Intent.EXTRA_TEXT, "遇到的问题：\n\n（请描述复现步骤）\n\n--- 自动附加信息 ---\n版本 ${BuildConfig.VERSION_NAME} / ${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE}\n日志见附件。")
-            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(
+                Intent.EXTRA_TEXT,
+                "遇到的问题：\n\n（请描述复现步骤）\n\n--- 自动附加信息 ---\n版本 ${BuildConfig.VERSION_NAME} / ${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE}\n日志见附件。" +
+                    if (sessionFiles.isNotEmpty()) "\n附 ${sessionFiles.size} 个问题会话导出。" else "",
+            )
+            if (uris.size > 1) putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+            else putExtra(Intent.EXTRA_STREAM, uris[0])
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         context.startActivity(Intent.createChooser(intent, "发送反馈邮件").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))

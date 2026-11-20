@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Settings
@@ -75,6 +76,7 @@ fun SessionDrawerContent(
     onOpen: (String) -> Unit,
     onRename: (String, String) -> Unit,
     onDelete: (String) -> Unit,
+    onExportJson: (String) -> Unit,
     onSettings: () -> Unit,
 ) {
     val ds = LocalDsColors.current
@@ -167,6 +169,11 @@ fun SessionDrawerContent(
                                 text = { Text("重命名") },
                                 leadingIcon = { Icon(Icons.Filled.Edit, null, modifier = Modifier.size(18.dp)) },
                                 onClick = { menuFor = null; renameFor = meta },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("导出为 JSON") },
+                                leadingIcon = { Icon(Icons.Filled.Download, null, modifier = Modifier.size(18.dp)) },
+                                onClick = { menuFor = null; onExportJson(meta.id) },
                             )
                             DropdownMenuItem(
                                 text = { Text("删除", color = ds.error) },

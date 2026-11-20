@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -29,6 +30,7 @@ import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -72,9 +74,25 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
     var showDeleteAll by remember { mutableStateOf(false) }
     var showLinkImport by remember { mutableStateOf(false) }
     var linkUrl by remember { mutableStateOf("") }
+    var showFeedbackPicker by remember { mutableStateOf(false) }
+    var selectedFeedbackIds by remember { mutableStateOf(setOf<String>()) }
+    val feedbackSessions by vm.sessions.collectAsState()
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) pendingImportUri = uri
+    }
+    val singleJsonLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            scope.launch {
+                try {
+                    val id = context.contentResolver.openInputStream(uri)?.use { vm.importSessionJson { it } }
+                    vm.toast("已导入单个对话")
+                    if (id != null) vm.openSession(id)
+                } catch (e: Exception) {
+                    vm.toast("导入失败：${e.message ?: "不是有效的对话 JSON"}")
+                }
+            }
+        }
     }
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/zip"),
@@ -191,6 +209,13 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                 Icon(Icons.Filled.Link, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
             }
             SettingRow(
+                title = "导入单个对话（JSON）",
+                subtitle = "导入由「导出为 JSON」生成的单个对话，合并为新对话，不覆盖现有记录。",
+                onClick = { singleJsonLauncher.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) },
+            ) {
+                Icon(Icons.Filled.Upload, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
+            }
+            SettingRow(
                 title = "导出所有历史对话",
                 subtitle = "包含所有历史对话；不包含 API Key。",
                 onClick = { exportLauncher.launch(HistoryArchive.exportFileName()) },
@@ -209,11 +234,8 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             SectionTitle("帮助与反馈")
             SettingRow(
                 title = "问题反馈（一键邮件）",
-                subtitle = "遇到问题？自动附日志发送邮件给维护者",
-                onClick = {
-                    runCatching { com.dschat.app.util.FeedbackHelper.emailFeedback(context) }
-                        .onFailure { vm.toast("无法打开邮件应用：${it.message}") }
-                },
+                subtitle = "自动附日志，可勾选问题会话一并发送给维护者",
+                onClick = { selectedFeedbackIds = emptySet(); showFeedbackPicker = true },
             ) {
                 Icon(Icons.Filled.Email, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
             }
@@ -226,7 +248,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             }
 
             SectionTitle("关于与开源许可")
-            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.4.0 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.4.1 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
             SettingRow(
                 title = "检查更新",
                 subtitle = "优先国内云，GitHub 兜底",
@@ -328,6 +350,67 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                 ) { Text("下载并导入") }
             },
             dismissButton = { TextButton(onClick = { showLinkImport = false }) { Text("取消") } },
+        )
+    }
+
+    // 问题反馈：勾选问题会话一并邮件发送
+    if (showFeedbackPicker) {
+        AlertDialog(
+            onDismissRequest = { showFeedbackPicker = false },
+            title = { Text("问题反馈") },
+            text = {
+                Column {
+                    Text(
+                        "将自动附加应用日志。可勾选有问题的对话，一并导出发送给维护者。",
+                        fontSize = 13.sp, lineHeight = 19.sp, color = ds.labelSecondary,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Column(
+                        modifier = Modifier
+                            .heightIn(max = 280.dp)
+                            .verticalScroll(androidx.compose.foundation.rememberScrollState()),
+                    ) {
+                        feedbackSessions.forEach { meta ->
+                            val checked = meta.id in selectedFeedbackIds
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selectedFeedbackIds = if (checked) selectedFeedbackIds - meta.id else selectedFeedbackIds + meta.id
+                                    },
+                            ) {
+                                Checkbox(
+                                    checked = checked,
+                                    onCheckedChange = {
+                                        selectedFeedbackIds = if (it) selectedFeedbackIds + meta.id else selectedFeedbackIds - meta.id
+                                    },
+                                )
+                                Text(
+                                    meta.title.ifBlank { "新对话" },
+                                    fontSize = 14.sp, color = ds.labelPrimary,
+                                    maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val ids = selectedFeedbackIds.toList()
+                    showFeedbackPicker = false
+                    scope.launch {
+                        try {
+                            val files = ids.mapNotNull { vm.sessionJsonFile(it) }
+                            com.dschat.app.util.FeedbackHelper.emailFeedback(context, files)
+                        } catch (e: Exception) {
+                            vm.toast("无法打开邮件应用：${e.message}")
+                        }
+                    }
+                }) { Text("发送邮件") }
+            },
+            dismissButton = { TextButton(onClick = { showFeedbackPicker = false }) { Text("取消") } },
         )
     }
 
