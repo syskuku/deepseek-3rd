@@ -102,4 +102,23 @@ class MathNormalizerTest {
         assertEquals("\$\$\\frac{a}{b}\$\$", out)
         assertTrue(!out.contains("\$\$\$\$"))
     }
+
+    @Test
+    fun katexBgcolorMappedAndHashColor() {
+        val out = MathNormalizer.normalizeForKatex("\\bgcolor{6FA698}{\\fgcolor{FFFFFF}{x}}")
+        assertTrue(out.contains("\\colorbox{#6FA698}{\\textcolor{#FFFFFF}{x}}"))
+    }
+
+    @Test
+    fun katexScaleboxUnwrapped() {
+        val out = MathNormalizer.normalizeForKatex("\\(\\scalebox{1.5}{y}\\)")
+        assertTrue(out.contains("\$y\$"))
+        assertTrue(!out.contains("scalebox"))
+    }
+
+    @Test
+    fun katexParenToDollar() {
+        val out = MathNormalizer.normalizeForKatex("\\(E=mc^2\\)")
+        assertEquals("\$E=mc^2\$", out)
+    }
 }

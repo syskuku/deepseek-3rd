@@ -46,6 +46,106 @@ object MathNormalizer {
         if (core.isNotEmpty() && FORMULA_CMD.containsMatchIn(core) && !CJK.containsMatchIn(core)) "\$\$$core\$\$" else line
     }
 
+    /**
+     * 面向 KaTeX（WebView）的规范化：
+     * - 定界符前置转换 \(..\)->$..$、\[..\]->$$..$$（避免 markdown-it 转义破坏）。
+     * - 模型有时输出 JLatexMath 方言 \bgcolor/\fgcolor，映射为 KaTeX 原生 \colorbox/\textcolor。
+     * - 裸公式行包裹（跳过中文 prose 与已有 $$ 块）。
+     */
+    fun normalizeForKatex(md: String): String {
+        var s = md
+        s = Regex("\\\\\\[([\\s\\S]*?)\\\\\\]").replace(s) { "\$\$" + it.groupValues[1].trim() + "\$\$" }
+        s = Regex("\\\\\\(([\\s\\S]*?)\\\\\\)").replace(s) { "\$" + it.groupValues[1].trim() + "\$" }
+        s = mapCommands(s, mapOf("bgcolor" to "colorbox", "fgcolor" to "textcolor"))
+        s = unwrapScalebox(s)
+        s = fixKatexColors(s)
+        s = wrapBareFormulaLines(s)
+        return s
+    }
+
+    /** KaTeX 颜色需 #RRGGBB；把 colorbox/textcolor/fcolorbox 的裸 hex/[HTML] 颜色参数补 # */
+    private fun fixKatexColors(s: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < s.length) {
+            if (s[i] == '\\' && i + 1 < s.length && s[i + 1].isLetter()) {
+                val (cmd, next) = readCmd(s, i)
+                if (cmd == "colorbox" || cmd == "textcolor" || cmd == "fcolorbox") {
+                    val n = if (cmd == "fcolorbox") 3 else 2
+                    val parsed = readArgs(s, next, n)
+                    if (parsed != null) {
+                        val (args, end) = parsed
+                        sb.append('\\').append(cmd)
+                        for (a in 0 until n - 1) sb.append("{#").append(colorToHex(args[a])).append('}')
+                        sb.append('{').append(fixKatexColors(args.last())).append('}')
+                        i = end
+                        continue
+                    }
+                }
+                sb.append('\\').append(cmd)
+                i = next
+            } else {
+                sb.append(s[i])
+                i++
+            }
+        }
+        return sb.toString()
+    }
+
+    /** KaTeX 不支持 \scalebox，解包保留内容（递归），避免整块渲染失败 */
+    private fun unwrapScalebox(s: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < s.length) {
+            if (s[i] == '\\' && i + 1 < s.length && s[i + 1].isLetter()) {
+                val (cmd, next) = readCmd(s, i)
+                if (cmd == "scalebox") {
+                    val parsed = readArgs(s, next, 2)
+                    if (parsed != null) {
+                        val (args, end) = parsed
+                        sb.append(unwrapScalebox(args[1]))
+                        i = end
+                        continue
+                    }
+                }
+                sb.append('\\').append(cmd)
+                i = next
+            } else {
+                sb.append(s[i])
+                i++
+            }
+        }
+        return sb.toString()
+    }
+
+    /** 把指定命令重写为目标命令（保留平衡花括号参数，递归处理内容） */
+    private fun mapCommands(s: String, mapping: Map<String, String>): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < s.length) {
+            if (s[i] == '\\' && i + 1 < s.length && s[i + 1].isLetter()) {
+                val (cmd, next) = readCmd(s, i)
+                val target = mapping[cmd]
+                if (target != null) {
+                    val parsed = readArgs(s, next, 2)
+                    if (parsed != null) {
+                        val (args, end) = parsed
+                        sb.append('\\').append(target).append('{').append(args[0]).append("}{")
+                            .append(mapCommands(args[1], mapping)).append('}')
+                        i = end
+                        continue
+                    }
+                }
+                sb.append('\\').append(cmd)
+                i = next
+            } else {
+                sb.append(s[i])
+                i++
+            }
+        }
+        return sb.toString()
+    }
+
     private fun readCmd(s: String, i: Int): Pair<String, Int> {
         var j = i + 1
         while (j < s.length && s[j].isLetter()) j++

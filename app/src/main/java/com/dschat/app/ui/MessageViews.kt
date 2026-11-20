@@ -395,10 +395,8 @@ fun AssistantMessageView(
                             Text(block.text, fontSize = 14.sp, lineHeight = 22.sp, color = ds.error)
                         }
                     } else if (block.text.isNotEmpty()) {
-                        RichContent(
-                            text = block.text,
-                            textColor = ds.labelPrimary.toArgb(),
-                            linkColor = ds.brandText.toArgb(),
+                        RichMarkdown(
+                            markdown = block.text,
                             modifier = Modifier.padding(bottom = 6.dp),
                         )
                     }

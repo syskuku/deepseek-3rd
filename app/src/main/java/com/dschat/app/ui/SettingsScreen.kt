@@ -226,7 +226,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             }
 
             SectionTitle("关于与开源许可")
-            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.3.9 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.4.0 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
             SettingRow(
                 title = "检查更新",
                 subtitle = "优先国内云，GitHub 兜底",
