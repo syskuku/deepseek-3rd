@@ -42,6 +42,9 @@
 - **上下文与官方 demo 一致：全量可用轮次，不截断**（曾误加截断被用户要求 revert）。
 - 消息树：流式回写**保留 parentId/selectedChildId**；新增用 `appendRound`；否则回复不可见/错误分叉。
 - 个别图片上传失败→**跳过该图不阻断发送**（`localPath=null` 排除出请求）。
+- **单对话 JSON**（`SessionJson`）：导出 `{format:"ds3rd-session",session,attachments:base64}`；导入**合并为新会话**（新 id、附件落盘、serverId 置空），不覆盖。入口：抽屉「导出为 JSON」、设置「导入单个对话(JSON)」。
+- **反馈邮件**（`FeedbackHelper.emailFeedback(context, sessionFiles)`）：可勾选问题会话，`ACTION_SEND_MULTIPLE` 附日志+会话 JSON。
+- **长按用户消息复制**：`UserMessageView` `combinedClickable`（需 `@OptIn(ExperimentalFoundationApi)`）+ 剪贴板 + Toast。
 
 ## 4. 渲染 / 媒体坑
 
@@ -49,6 +52,7 @@
 - **markdown-it 会转义 `\\` 破坏 LaTeX**：render.html 必须先把公式段（$$/$/\(/\[）stash 保护，markdown 渲染后再回填给 KaTeX auto-render。
 - **KaTeX 方言差异**（`MathNormalizer.normalizeForKatex`）：模型可能输出 `\bgcolor/\fgcolor`→映射 `\colorbox/\textcolor`；`\scalebox` KaTeX 不支持→解包保留内容；颜色裸 hex 需补 `#`；`\(...\)`→`$`、`\[...\]`→`$$` 前置转换。
 - WebView 高度由页面 `Android.setHeight` 回传自适应；`setTheme`/`renderMarkdown` 只能在 `onPageFinished` 后调用（否则 ReferenceError）。
+- **每条回复只建一个 WebView**：模型搜索穿插会产生多个 Text 块，若每块各建 WebView 会 OOM 闪退（导入/聊天崩溃）。`AssistantMessageView` 须把非模板 Text 块合并成一段再交给单个 `RichMarkdown`。
 - **长图**：Files API 能传但模型拒收超长图（`unsupported image`）→**上传前缩到 ≤4096**（`ImageResize`）。全屏看长图也要限制解码尺寸（超 Android 纹理上限会崩）。
 - **公式（JLatexMath 路径）**：只认 `$$`；转换 `\(...\)`、`\[...\]`、单 `$`；裸公式行包裹且去首尾 `$$` 防漏；`\fcolorbox/\colorbox/\textcolor`→`\fgcolor/\bgcolor`；`[HTML]/[rgb]` 与 `#hex`；基线反射 `ALIGN_BASELINE`。
 - **TTS 爆音**：PCM 16-bit 奇数字节跨块错位→carry 尾字节、只写偶数字节（`TtsPlayer`）。

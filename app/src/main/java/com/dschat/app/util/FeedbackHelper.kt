@@ -24,8 +24,9 @@ object FeedbackHelper {
         sb.append("时间: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())}\n")
         sb.append("设备: ${Build.MANUFACTURER} ${Build.MODEL}\n")
         sb.append("Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n")
-        sb.append("---- 应用日志 (logcat) ----\n")
-        sb.append(readLogcat())
+        sb.append("日志大小: ${AppLog.sizeBytes() / 1024} KB（上限2MB，仅近2天）\n")
+        sb.append("---- 应用日志（近2天，不含API Key）----\n")
+        sb.append(AppLog.readRecent(2))
         return sb.toString()
     }
 

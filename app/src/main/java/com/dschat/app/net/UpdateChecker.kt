@@ -51,7 +51,9 @@ object UpdateChecker {
 
     /** 拉取最新版本：优先国内对象存储 manifest，失败再回退 GitHub Releases */
     suspend fun fetchLatest(): UpdateInfo? = withContext(Dispatchers.IO) {
-        fetchCloud() ?: fetchGitHub()
+        val info = fetchCloud() ?: fetchGitHub()
+        com.dschat.app.util.AppLog.log("update", "fetchLatest -> ${info?.version ?: "none"}")
+        info
     }
 
     /** 国内云 manifest：先 Worker 域名（无验证），再 kodo；均失败返回 null 走 GitHub */

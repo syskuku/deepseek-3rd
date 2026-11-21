@@ -77,6 +77,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
     var showFeedbackPicker by remember { mutableStateOf(false) }
     var selectedFeedbackIds by remember { mutableStateOf(setOf<String>()) }
     val feedbackSessions by vm.sessions.collectAsState()
+    var logRefresh by remember { mutableStateOf(0) }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) pendingImportUri = uri
@@ -246,9 +247,20 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             ) {
                 Icon(Icons.Filled.Description, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
             }
+            SettingRow(
+                title = "清除已记录日志",
+                subtitle = "当前 ${remember(logRefresh) { com.dschat.app.util.AppLog.sizeBytes() / 1024 }} KB（上限2MB，不含API Key）",
+                onClick = {
+                    com.dschat.app.util.AppLog.clear()
+                    logRefresh++
+                    vm.toast("日志已清除")
+                },
+            ) {
+                Icon(Icons.Filled.DeleteOutline, null, tint = ds.labelTertiary, modifier = Modifier.size(18.dp))
+            }
 
             SectionTitle("关于与开源许可")
-            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.4.1 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
+            SettingRow(title = "DeepSeek(3rd)", subtitle = "版本 0.4.3 · 第三方 Android 移植，非 DeepSeek 官方产品") {}
             SettingRow(
                 title = "检查更新",
                 subtitle = "优先国内云，GitHub 兜底",

@@ -36,35 +36,41 @@ object RequestBuilder {
         return listOf(date, weekday, "", "App", "中文").joinToString(",")
     }
 
-    /** 助手历史 → content 块：仅文本，相邻合并、隔开的用空行连接 */
-    private fun assistantContent(message: ChatMessage): JsonArray = buildJsonArray {
+    /** 助手历史 → content 块：仅文本，相邻合并、隔开的用空行连接；cache=true 时末块加缓存断点 */
+    private fun assistantContent(message: ChatMessage, cache: Boolean = false): JsonArray {
+        val blocks = mutableListOf<JsonObject>()
         var pendingText: StringBuilder? = null
         var lastWasText = false
+        fun flush() {
+            val t = pendingText?.toString() ?: ""
+            if (t.isNotEmpty()) blocks.add(buildJsonObject { put("type", "text"); put("text", t) })
+            pendingText = null
+        }
         for (block in message.blocks) {
             when (block) {
                 is ReplyBlock.Text -> {
                     if (block.isTemplate) continue
-                    if (pendingText == null) {
-                        pendingText = StringBuilder()
-                        if (lastWasText) pendingText.append("\n\n")
+                    var sb = pendingText
+                    if (sb == null) {
+                        sb = StringBuilder()
+                        if (lastWasText) sb.append("\n\n")
+                        pendingText = sb
                     }
-                    pendingText.append(block.text)
+                    sb.append(block.text)
                     lastWasText = true
                 }
-                else -> {
-                    if (pendingText != null) {
-                        val t = pendingText.toString()
-                        if (t.isNotEmpty()) addJsonObject { put("type", "text"); put("text", t) }
-                        pendingText = null
-                    }
-                    lastWasText = false
-                }
+                else -> { flush(); lastWasText = false }
             }
         }
-        if (pendingText != null) {
-            val t = pendingText.toString()
-            if (t.isNotEmpty()) addJsonObject { put("type", "text"); put("text", t) }
+        flush()
+        if (cache && blocks.isNotEmpty()) {
+            val last = blocks.removeAt(blocks.size - 1)
+            blocks.add(buildJsonObject {
+                last.forEach { k, v -> put(k, v) }
+                putJsonObject("cache_control") { put("type", "ephemeral") }
+            })
         }
+        return JsonArray(blocks)
     }
 
     /** 续写前缀：保留本轮非空白思考（开启思考时）与正文 */
@@ -116,6 +122,8 @@ object RequestBuilder {
         prefix: ChatMessage? = null,
         thinking: Boolean = false,
     ): JsonArray = buildJsonArray {
+        // 先收集成对轮次，便于给末轮助手加 prompt caching 断点
+        val pairs = ArrayList<Pair<ChatMessage, ChatMessage>>()
         var i = 0
         while (i + 1 < history.size) {
             val user = history[i]
@@ -123,14 +131,13 @@ object RequestBuilder {
             if (user.role == "user" && reply.isUsableReply) {
                 val hasText = user.content.isNotBlank()
                 val hasFiles = user.files.any { it.serverId != null }
-                if (hasText || hasFiles) {
-                    addJsonObject { put("role", "user"); put("content", userContent(user)) }
-                    addJsonObject { put("role", "assistant"); put("content", assistantContent(reply)) }
-                }
+                if (hasText || hasFiles) pairs.add(user to reply)
                 i += 2
-            } else {
-                i += 1
-            }
+            } else i += 1
+        }
+        pairs.forEachIndexed { idx, (user, reply) ->
+            addJsonObject { put("role", "user"); put("content", userContent(user)) }
+            addJsonObject { put("role", "assistant"); put("content", assistantContent(reply, cache = idx == pairs.size - 1)) }
         }
         addJsonObject { put("role", "latest_reminder"); put("content", latestReminder()) }
         addJsonObject { put("role", "user"); put("content", userContent(question)) }
@@ -156,7 +163,14 @@ object RequestBuilder {
         requestTitle: Boolean,
     ): JsonObject = buildJsonObject {
         put("model", DeepSeekClient.MODEL)
-        put("system", DeepSeekClient.SYSTEM_PROMPT)
+        // system 用块数组并加缓存断点，保障 prompt caching 命中
+        putJsonArray("system") {
+            addJsonObject {
+                put("type", "text")
+                put("text", DeepSeekClient.SYSTEM_PROMPT)
+                putJsonObject("cache_control") { put("type", "ephemeral") }
+            }
+        }
         put("messages", messages)
         putJsonObject("thinking") { put("type", if (thinking) "enabled" else "disabled") }
         putJsonObject("safety_check") { put("level", "high") }

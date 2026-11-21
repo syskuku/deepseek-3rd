@@ -104,6 +104,8 @@ object DeepSeekClient {
      * purpose 必须排在 file 之前；图片不传 purpose。对照官方 uploadFile。
      */
     suspend fun uploadFile(apiKey: String, name: String, mimeType: String, purpose: String?, bytes: ByteArray): String {
+        val t0 = System.currentTimeMillis()
+        com.dschat.app.util.AppLog.log("upload", "start name=$name size=${bytes.size} mime=$mimeType purpose=$purpose")
         val form = MultipartBody.Builder().setType(MultipartBody.FORM)
         if (purpose != null) form.addFormDataPart("purpose", purpose)
         form.addFormDataPart(
@@ -120,8 +122,10 @@ object DeepSeekClient {
         val text = response.use { it.body?.string() ?: "" }
         val obj = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull()
             ?: throw ApiError(ApiErrorKind.PROTOCOL, "上传响应无效")
-        return obj["id"]?.jsonPrimitive?.content
+        val id = obj["id"]?.jsonPrimitive?.content
             ?: throw ApiError(ApiErrorKind.PROTOCOL, "上传响应缺少 file_id")
+        com.dschat.app.util.AppLog.log("upload", "ok name=$name id=$id ms=${System.currentTimeMillis() - t0}")
+        return id
     }
 
     private suspend fun executeChecked(request: Request): okhttp3.Response =

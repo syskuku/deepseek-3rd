@@ -393,25 +393,31 @@ fun AssistantMessageView(
 
         if (streaming && message.blocks.isEmpty()) WaitingDots()
 
+        // 思考/搜索按序渲染；正文 Text 块合并为一段，只用一个 WebView（避免多 WebView OOM 闪退）
+        val textParts = StringBuilder()
+        val templates = mutableListOf<String>()
         message.blocks.forEach { block ->
             when (block) {
                 is ReplyBlock.Thinking -> ThinkingSection(block, streaming)
                 is ReplyBlock.Search -> SearchSection(block)
                 is ReplyBlock.Text -> {
-                    if (block.isTemplate) {
-                        Row(modifier = Modifier.padding(top = 8.dp)) {
-                            Icon(Icons.Filled.ErrorOutline, null, tint = ds.error, modifier = Modifier.size(16.dp).padding(top = 3.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(block.text, fontSize = 14.sp, lineHeight = 22.sp, color = ds.error)
-                        }
-                    } else if (block.text.isNotEmpty()) {
-                        RichMarkdown(
-                            markdown = block.text,
-                            modifier = Modifier.padding(bottom = 6.dp),
-                        )
-                    }
+                    if (block.isTemplate) templates.add(block.text)
+                    else if (block.text.isNotEmpty()) textParts.append(block.text).append("\n\n")
                 }
             }
+        }
+        templates.forEach { t ->
+            Row(modifier = Modifier.padding(top = 8.dp)) {
+                Icon(Icons.Filled.ErrorOutline, null, tint = ds.error, modifier = Modifier.size(16.dp).padding(top = 3.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(t, fontSize = 14.sp, lineHeight = 22.sp, color = ds.error)
+            }
+        }
+        if (textParts.isNotBlank()) {
+            RichMarkdown(
+                markdown = textParts.toString().trim(),
+                modifier = Modifier.padding(bottom = 6.dp),
+            )
         }
 
         if (message.status == "error" && message.errorText != null) {

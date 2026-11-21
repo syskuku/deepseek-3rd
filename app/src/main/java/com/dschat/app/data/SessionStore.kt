@@ -53,6 +53,7 @@ class SessionStore(private val context: Context) {
                     }.getOrNull()
                 }
                 ?.sortedByDescending { it.updatedAt }
+                ?.distinctBy { it.id }
                 ?: emptyList()
         }
     }

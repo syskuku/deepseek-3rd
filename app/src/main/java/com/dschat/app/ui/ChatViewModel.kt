@@ -155,9 +155,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val session = store.load(id)?.normalized()?.repaired()
             if (session == null) {
+                com.dschat.app.util.AppLog.log("session", "open FAIL id=$id")
                 toast("对话加载失败，请重试")
                 _sessions.value = store.listMetas()
             } else {
+                com.dschat.app.util.AppLog.log("session", "open id=$id msgs=${session.messages.size} visible=${session.visibleMessages().size}")
                 _active.value = session
                 _drafts.value = emptyList()
             }
@@ -513,9 +515,27 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         val messages = RequestBuilder.toRequestMessages(history, liveQuestion, prefix, reply.thinking)
                         val hasFiles = RequestBuilder.hasFileBlocks(history, liveQuestion)
                         val body = RequestBuilder.buildBody(messages, reply.thinking, reply.search, requestTitle && currentBase.title.isBlank())
+                        com.dschat.app.util.AppLog.log("send", "session=$sessionId thinking=${reply.thinking} search=${reply.search} historyRounds=${history.size / 2} hasFiles=$hasFiles attempt=$attempt")
 
                         DeepSeekClient.streamMessage(apiKey, body, hasFiles).collect { event ->
                             receivedContent = receivedContent || event is StreamEvent.BlockStart
+                            when (event) {
+                                is StreamEvent.MessageStart -> com.dschat.app.util.AppLog.log("usage", "message_start ${fmtUsage(event.usage)}")
+                                is StreamEvent.BlockStart -> {
+                                    val bt = event.block["type"]?.toString() ?: ""
+                                    if (bt.contains("server_tool_use")) {
+                                        val q = event.block["input"]?.jsonObject?.get("queries")?.jsonArray?.joinToString(",") { it.jsonPrimitive.content }
+                                        com.dschat.app.util.AppLog.log("tool", "search queries=[$q]")
+                                    } else if (bt.contains("web_search_tool_result")) {
+                                        val n = event.block["content"]?.jsonArray?.size ?: 0
+                                        com.dschat.app.util.AppLog.log("tool", "search results=$n")
+                                    } else {
+                                        com.dschat.app.util.AppLog.log("stream", "block_start idx=${event.index} type=$bt")
+                                    }
+                                }
+                                is StreamEvent.MessageDelta -> com.dschat.app.util.AppLog.log("usage", "message_delta stop=${event.stopReason} ${fmtUsage(event.usage)}")
+                                else -> {}
+                            }
                             reply = applyEvent(reply, event, blockIndexes)
                             if (event is StreamEvent.MessageDelta) {
                                 val title = event.title?.trim()
@@ -541,6 +561,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         withContext(NonCancellable) { persistActive(force = true) }
                         throw e
                     } catch (e: Throwable) {
+                        com.dschat.app.util.AppLog.log("error", "send failed session=$sessionId ${e.javaClass.simpleName}: ${e.message}")
                         // 附件失效：重传一次
                         if (!fileRetryUsed && e is ApiError && AttachmentRules.isFileIdError(e.status, e.message)) {
                             fileRetryUsed = true
@@ -579,6 +600,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         ApiCondition.NETWORK -> "网络异常，请检查你的网络状况"
         ApiCondition.TOO_LARGE -> "内容过长，请缩短后重试"
         ApiCondition.OTHER -> (e.message?.takeIf { it.isNotBlank() } ?: "未知错误")
+    }
+
+    private fun fmtUsage(u: JsonObject?): String {
+        if (u == null) return "usage=null"
+        fun g(k: String) = u[k]?.jsonPrimitive?.content ?: "0"
+        return "in=${g("input_tokens")} out=${g("output_tokens")} cacheRead=${g("cache_read_input_tokens")} cacheWrite=${g("cache_creation_input_tokens")}"
     }
 
     private fun applyEvent(reply: ChatMessage, event: StreamEvent, blockIndexes: HashMap<Int, Int>): ChatMessage {
@@ -782,6 +809,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 store.saveAttachment(newId, fid, name, bytes)
             }
             store.save(session)
+            com.dschat.app.util.AppLog.log("import", "single json -> newId=$newId msgs=${session.messages.size}")
             refreshMetas()
             newId
         } finally {
