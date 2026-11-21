@@ -40,6 +40,7 @@
 - 官方导出 ZIP 的图片是 **STORED+EXT**：必须用 `java.util.zip.ZipFile`（读中央目录），**ZipInputStream 在 Android 读 0 字节**（曾致 `'file' is empty`）。
 - 导入附件 `serverId=null`，首次发送才补传 → 大会话（上百图）首send 很慢，属正常；**不要**为此截断上下文。
 - **上下文与官方 demo 一致：全量可用轮次，不截断**（曾误加截断被用户要求 revert）。
+- **prompt caching**：DeepSeek 对稳定前缀自动缓存，但为确定性须显式加 `cache_control:{type:ephemeral}` 断点（system 块数组 + 末轮助手末块）。前缀必须稳定（system 常量、latest_reminder 放历史之后）。用真实 Key 递增请求验证 cache_read>0。
 - 消息树：流式回写**保留 parentId/selectedChildId**；新增用 `appendRound`；否则回复不可见/错误分叉。
 - 个别图片上传失败→**跳过该图不阻断发送**（`localPath=null` 排除出请求）。
 - **单对话 JSON**（`SessionJson`）：导出 `{format:"ds3rd-session",session,attachments:base64}`；导入**合并为新会话**（新 id、附件落盘、serverId 置空），不覆盖。入口：抽屉「导出为 JSON」、设置「导入单个对话(JSON)」。
