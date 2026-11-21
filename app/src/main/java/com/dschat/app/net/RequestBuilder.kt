@@ -36,8 +36,8 @@ object RequestBuilder {
         return listOf(date, weekday, "", "App", "中文").joinToString(",")
     }
 
-    /** 助手历史 → content 块：仅文本，相邻合并、隔开的用空行连接 */
-    private fun assistantContent(message: ChatMessage): JsonArray {
+    /** 助手历史 → content 块：仅文本，相邻合并、隔开的用空行连接；cache=true 末块加缓存断点 */
+    private fun assistantContent(message: ChatMessage, cache: Boolean = false): JsonArray {
         val blocks = mutableListOf<JsonObject>()
         var pendingText: StringBuilder? = null
         var lastWasText = false
@@ -63,6 +63,13 @@ object RequestBuilder {
             }
         }
         flush()
+        if (cache && blocks.isNotEmpty()) {
+            val last = blocks.removeAt(blocks.size - 1)
+            blocks.add(buildJsonObject {
+                last.forEach { k, v -> put(k, v) }
+                putJsonObject("cache_control") { put("type", "ephemeral") }
+            })
+        }
         return JsonArray(blocks)
     }
 
@@ -115,6 +122,7 @@ object RequestBuilder {
         prefix: ChatMessage? = null,
         thinking: Boolean = false,
     ): JsonArray = buildJsonArray {
+        val pairs = ArrayList<Pair<ChatMessage, ChatMessage>>()
         var i = 0
         while (i + 1 < history.size) {
             val user = history[i]
@@ -122,12 +130,13 @@ object RequestBuilder {
             if (user.role == "user" && reply.isUsableReply) {
                 val hasText = user.content.isNotBlank()
                 val hasFiles = user.files.any { it.serverId != null }
-                if (hasText || hasFiles) {
-                    addJsonObject { put("role", "user"); put("content", userContent(user)) }
-                    addJsonObject { put("role", "assistant"); put("content", assistantContent(reply)) }
-                }
+                if (hasText || hasFiles) pairs.add(user to reply)
                 i += 2
             } else i += 1
+        }
+        pairs.forEachIndexed { idx, (user, reply) ->
+            addJsonObject { put("role", "user"); put("content", userContent(user)) }
+            addJsonObject { put("role", "assistant"); put("content", assistantContent(reply, cache = idx == pairs.size - 1)) }
         }
         addJsonObject { put("role", "latest_reminder"); put("content", latestReminder()) }
         addJsonObject { put("role", "user"); put("content", userContent(question)) }
@@ -153,7 +162,14 @@ object RequestBuilder {
         requestTitle: Boolean,
     ): JsonObject = buildJsonObject {
         put("model", DeepSeekClient.MODEL)
-        put("system", DeepSeekClient.SYSTEM_PROMPT)
+        // system 块数组 + 缓存断点，确定性命中 prompt caching
+        putJsonArray("system") {
+            addJsonObject {
+                put("type", "text")
+                put("text", DeepSeekClient.SYSTEM_PROMPT)
+                putJsonObject("cache_control") { put("type", "ephemeral") }
+            }
+        }
         put("messages", messages)
         putJsonObject("thinking") { put("type", if (thinking) "enabled" else "disabled") }
         putJsonObject("safety_check") { put("level", "high") }

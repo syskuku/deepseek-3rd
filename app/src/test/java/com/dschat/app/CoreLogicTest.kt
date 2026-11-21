@@ -339,6 +339,18 @@ class RequestBuilderTest {
     }
 
     @Test
+    fun promptCacheBreakpoints() {
+        val u = ChatMessage("u", "user", 1L, content = "问")
+        val a = ChatMessage("a", "assistant", 2L, blocks = listOf(ReplyBlock.Text("答")), parentId = "u")
+        val msgs = RequestBuilder.toRequestMessages(listOf(u, a), ChatMessage("q", "user", 3L, content = "再问"))
+        val lastBlock = msgs[1].jsonObject["content"]!!.jsonArray.last().jsonObject
+        assertEquals("ephemeral", lastBlock["cache_control"]!!.jsonObject["type"]!!.jsonPrimitive.content)
+        val body = RequestBuilder.buildBody(msgs, false, false, false)
+        val sys = body["system"]!!.jsonArray.first().jsonObject
+        assertEquals("ephemeral", sys["cache_control"]!!.jsonObject["type"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun bodyShape() {
         val body = RequestBuilder.buildBody(JsonArray(emptyList()), thinking = true, search = true, requestTitle = true)
         assertEquals("deepseek-flash", body["model"]!!.jsonPrimitive.content)
