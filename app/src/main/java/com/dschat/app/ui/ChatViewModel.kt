@@ -1,0 +1,1047 @@
+package com.dschat.app.ui
+
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.OpenableColumns
+import android.provider.Settings
+import androidx.core.content.FileProvider
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.dschat.app.BuildConfig
+import com.dschat.app.DeepSeekApp
+import com.dschat.app.data.ChatMessage
+import com.dschat.app.data.ContextCompressor
+import com.dschat.app.data.ContextSummary
+import com.dschat.app.data.FileMeta
+import com.dschat.app.data.HistoryArchive
+import com.dschat.app.data.ReplyBlock
+import com.dschat.app.data.SearchResult
+import com.dschat.app.data.Session
+import com.dschat.app.data.SessionMeta
+import com.dschat.app.data.SessionJson
+import com.dschat.app.data.SessionStore
+import com.dschat.app.net.ApiCondition
+import com.dschat.app.net.ApiError
+import com.dschat.app.net.ApiErrorKind
+import com.dschat.app.net.AttachmentRules
+import com.dschat.app.net.DeepSeekClient
+import com.dschat.app.net.RequestBuilder
+import com.dschat.app.net.StreamEvent
+import com.dschat.app.net.SummaryApi
+import com.dschat.app.net.UpdateChecker
+import com.dschat.app.net.classifyError
+import com.dschat.app.net.isRetryable
+import com.dschat.app.speech.TtsPlayer
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.concurrent.TimeUnit
+
+/** 输入框待发送附件 */
+data class DraftAttachment(
+    val id: String,
+    val name: String,
+    val size: Long,
+    val isImage: Boolean,
+    val mimeType: String,
+    val localPath: String,
+)
+
+class ChatViewModel(app: Application) : AndroidViewModel(app) {
+    private val settings = (app as DeepSeekApp).settings
+    private val store = SessionStore(app)
+
+    private val _sessions = MutableStateFlow<List<SessionMeta>>(emptyList())
+    val sessions: StateFlow<List<SessionMeta>> = _sessions
+
+    private val _active = MutableStateFlow<Session?>(null)
+    val active: StateFlow<Session?> = _active
+
+    private val _streamingSessionId = MutableStateFlow<String?>(null)
+    val streamingSessionId: StateFlow<String?> = _streamingSessionId
+
+    private val _thinking = MutableStateFlow(settings.thinking)
+    val thinking: StateFlow<Boolean> = _thinking
+
+    private val _search = MutableStateFlow(settings.search)
+    val search: StateFlow<Boolean> = _search
+
+    private val _theme = MutableStateFlow(settings.theme)
+    val theme: StateFlow<String> = _theme
+
+    private val _hasApiKey = MutableStateFlow(settings.apiKey != null)
+    val hasApiKey: StateFlow<Boolean> = _hasApiKey
+
+    private val _drafts = MutableStateFlow<List<DraftAttachment>>(emptyList())
+    val drafts: StateFlow<List<DraftAttachment>> = _drafts
+
+    private val _toast = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    val toast: SharedFlow<String> = _toast
+
+    private val _busy = MutableStateFlow(false)
+    val busy: StateFlow<Boolean> = _busy
+
+    /** 正在压缩上下文（网络请求中），UI 用于禁用发送并提示 */
+    private val _compressing = MutableStateFlow(false)
+    val compressing: StateFlow<Boolean> = _compressing
+
+    // ---- 朗读 ----
+    val tts = TtsPlayer(viewModelScope)
+    private val _readingId = MutableStateFlow<String?>(null)
+    val readingId: StateFlow<String?> = _readingId
+    private val _autoRead = MutableStateFlow(settings.autoRead)
+    val autoRead: StateFlow<Boolean> = _autoRead
+
+    init {
+        tts.onState = { _readingId.value = tts.messageId }
+    }
+
+    fun setAutoRead(value: Boolean) { _autoRead.value = value; settings.autoRead = value }
+
+    /** 点击回复喇叭：朗读/停止 */
+    fun toggleReadAloud(message: ChatMessage) {
+        val key = settings.apiKey ?: return
+        tts.toggle(key, message.id, message.replyText, settings.ttsVoice) { err -> toast(err) }
+    }
+
+    fun stopReadAloud() = tts.stop()
+
+    private var streamJob: Job? = null
+    private var lastSaveAt = 0L
+
+    init {
+        viewModelScope.launch { _sessions.value = store.listMetas() }
+    }
+
+    fun toast(message: String) { _toast.tryEmit(message) }
+
+    // ------------------------------------------------------------ settings
+
+    suspend fun verifyAndSaveApiKey(key: String) {
+        DeepSeekClient.verifyApiKey(key)
+        settings.apiKey = key
+        _hasApiKey.value = true
+    }
+
+    fun currentApiKey(): String = settings.apiKey ?: ""
+
+    fun setThinking(value: Boolean) { _thinking.value = value; settings.thinking = value }
+    fun setSearch(value: Boolean) { _search.value = value; settings.search = value }
+    fun setTheme(value: String) { _theme.value = value; settings.theme = value }
+
+    // ------------------------------------------------------------ sessions
+
+    fun newChat() {
+        if (_streamingSessionId.value != null) stop()
+        _active.value = null
+        _drafts.value = emptyList()
+    }
+
+    fun openSession(id: String) {
+        viewModelScope.launch {
+            val session = store.load(id)?.normalized()?.repaired()
+            if (session == null) {
+                com.dschat.app.util.AppLog.log("session", "open FAIL id=$id")
+                toast("对话加载失败，请重试")
+                _sessions.value = store.listMetas()
+            } else {
+                com.dschat.app.util.AppLog.log("session", "open id=$id msgs=${session.messages.size} visible=${session.visibleMessages().size}")
+                _active.value = session
+                _drafts.value = emptyList()
+            }
+        }
+    }
+
+    fun renameSession(id: String, title: String) {
+        viewModelScope.launch {
+            val session = if (_active.value?.id == id) _active.value else store.load(id)
+            if (session != null) {
+                val updated = session.copy(title = title.trim(), updatedAt = System.currentTimeMillis())
+                store.save(updated)
+                if (_active.value?.id == id) _active.value = updated
+                refreshMetas()
+            }
+        }
+    }
+
+    fun deleteSession(id: String) {
+        viewModelScope.launch {
+            if (_streamingSessionId.value == id) stop()
+            store.delete(id)
+            if (_active.value?.id == id) _active.value = null
+            refreshMetas()
+        }
+    }
+
+    fun deleteAllSessions() {
+        viewModelScope.launch {
+            stop()
+            store.deleteAll()
+            _active.value = null
+            _drafts.value = emptyList()
+            refreshMetas()
+            toast("删除成功")
+        }
+    }
+
+    private suspend fun refreshMetas() { _sessions.value = store.listMetas() }
+
+    private fun upsertMeta(session: Session) {
+        val meta = session.meta()
+        _sessions.value = (listOf(meta) + _sessions.value.filter { it.id != session.id })
+            .sortedByDescending { it.updatedAt }
+    }
+
+    private fun updateActive(transform: (Session) -> Session) {
+        val current = _active.value ?: return
+        val next = transform(current)
+        _active.value = next
+        upsertMeta(next)
+    }
+
+    private suspend fun persistActive(force: Boolean = false) {
+        val session = _active.value ?: return
+        val now = System.currentTimeMillis()
+        if (force || now - lastSaveAt > 2000) {
+            lastSaveAt = now
+            store.save(session)
+        }
+    }
+
+    /** 替换树中某条消息 */
+    private fun Session.replaceMessage(m: ChatMessage): Session =
+        copy(messages = messages.map { if (it.id == m.id) m else it }, updatedAt = System.currentTimeMillis())
+
+    // ------------------------------------------------------------ drafts
+
+    /** 从 SAF 选择结果添加草稿（校验格式/大小/数量，原件存入私有目录） */
+    fun addDrafts(uris: List<Uri>) {
+        val context = getApplication<DeepSeekApp>()
+        viewModelScope.launch(Dispatchers.IO) {
+            val added = ArrayList<DraftAttachment>()
+            for (uri in uris) {
+                var name = "file"
+                var size = 0L
+                runCatching {
+                    context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                        if (c.moveToFirst()) {
+                            val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            val si = c.getColumnIndex(OpenableColumns.SIZE)
+                            if (ni >= 0) name = c.getString(ni) ?: name
+                            if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+                        }
+                    }
+                }
+                val mime = context.contentResolver.getType(uri) ?: ""
+                val isImage = mime.startsWith("image/") || AttachmentRules.isImageExt(name)
+                val error = AttachmentRules.validate(name, size, isImage, _drafts.value.size + added.size)
+                if (error != null) {
+                    withContext(Dispatchers.Main) { toast(error) }
+                    continue
+                }
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: continue
+                val id = SessionStore.newId()
+                val rel = store.saveAttachment("drafts", id, name, bytes)
+                added += DraftAttachment(id, name, bytes.size.toLong(), isImage, AttachmentRules.mimeOf(name, mime), rel)
+            }
+            withContext(Dispatchers.Main) {
+                if (added.isNotEmpty()) _drafts.value = _drafts.value + added
+            }
+        }
+    }
+
+    fun removeDraft(id: String) {
+        val draft = _drafts.value.find { it.id == id } ?: return
+        _drafts.value = _drafts.value.filter { it.id != id }
+        viewModelScope.launch(Dispatchers.IO) { runCatching { store.attachmentFile(draft.localPath).delete() } }
+    }
+
+    // ------------------------------------------------------------ chat
+
+    fun send(text: String) {
+        val content = text.trim()
+        val drafts = _drafts.value
+        if ((content.isEmpty() && drafts.isEmpty()) || _streamingSessionId.value != null) return
+        if (_compressing.value) { toast("正在压缩上下文，请稍候"); return }
+        val apiKey = settings.apiKey
+        if (apiKey == null) { toast("请先设置 API Key"); return }
+        stopReadAloud()
+
+        val now = System.currentTimeMillis()
+        var session = (_active.value ?: Session(SessionStore.newId(), "", now, now, emptyList())).normalized()
+
+        val files = drafts.map { d ->
+            FileMeta(d.id, d.name, d.size, d.isImage, d.mimeType, d.localPath, null)
+        }
+        val userMsg = ChatMessage(
+            SessionStore.newId(), "user", now, content = content, files = files,
+        )
+        val assistant = ChatMessage(
+            SessionStore.newId(), "assistant", now + 1,
+            status = "streaming", thinking = _thinking.value, search = _search.value,
+        )
+        // 统一走 appendRound：正确链接 parentId / selectedChildId，避免回复不可见或错误分叉
+        session = session.appendRound(userMsg, assistant)
+        _active.value = session
+        _drafts.value = emptyList()
+        upsertMeta(session)
+        // 取链接后的副本进入流式状态机，避免回写时覆盖树字段
+        val linkedUser = session.messages.first { it.id == userMsg.id }
+        val linkedAssistant = session.messages.first { it.id == assistant.id }
+        startStream(session, linkedUser, linkedAssistant, prefix = null, apiKey = apiKey)
+    }
+
+    /** 语音识别后直接发送（不经文本框） */
+    fun sendVoice(wav: ByteArray) {
+        val apiKey = settings.apiKey ?: return
+        viewModelScope.launch {
+            try {
+                val text = com.dschat.app.net.SpeechApi.transcribe(apiKey, wav).trim()
+                if (text.isEmpty()) { toast("未识别到语音内容"); return@launch }
+                send(text)
+            } catch (e: Exception) {
+                toast("语音识别失败：${e.message ?: "请稍后再试"}")
+            }
+        }
+    }
+
+    /** 编辑用户消息：fork 成新兄弟分支并重新回答（官方 edit 语义） */
+    fun editUserMessage(messageId: String, newContent: String) {
+        val session = _active.value?.normalized() ?: return
+        if (_streamingSessionId.value != null || _compressing.value) return
+        val apiKey = settings.apiKey ?: return
+        val original = session.messages.find { it.id == messageId } ?: return
+        if (original.role != "user") return
+        val content = newContent.trim()
+        if (content.isEmpty()) return
+        stopReadAloud()
+
+        val now = System.currentTimeMillis()
+        val newUser = original.copy(
+            id = SessionStore.newId(), createdAt = now, content = content,
+            selectedChildId = null,
+        )
+        val assistant = ChatMessage(
+            SessionStore.newId(), "assistant", now + 1,
+            status = "streaming", thinking = _thinking.value, search = _search.value,
+        )
+        // 新提问挂在原提问的父节点下，成为兄弟；父节点选中新提问
+        val parentId = original.parentId
+        var messages = session.messages.map {
+            if (it.id == parentId) it.copy(selectedChildId = newUser.id) else it
+        }
+        val linkedUser = newUser.copy(parentId = parentId, selectedChildId = assistant.id)
+        val linkedAssistant = assistant.copy(parentId = linkedUser.id)
+        messages = messages + linkedUser + linkedAssistant
+        val base = session.copy(
+            messages = messages,
+            rootMessageId = if (parentId == null) linkedUser.id else session.rootMessageId,
+            updatedAt = now,
+        )
+        _active.value = base
+        upsertMeta(base)
+        startStream(base, linkedUser, linkedAssistant, prefix = null, apiKey = apiKey)
+    }
+
+    /** 重新生成：在同一提问下新建兄弟分支（官方 appendBranch 语义） */
+    fun regenerate(assistantId: String) {
+        val session = _active.value?.normalized() ?: return
+        if (_streamingSessionId.value != null || _compressing.value) return
+        val apiKey = settings.apiKey ?: return
+        val original = session.messages.find { it.id == assistantId } ?: return
+        if (original.role != "assistant") return
+        val question = session.messages.find { it.id == original.parentId } ?: return
+        if (question.role != "user") return
+
+        val now = System.currentTimeMillis()
+        val assistant = ChatMessage(
+            SessionStore.newId(), "assistant", now,
+            status = "streaming", thinking = original.thinking, search = original.search,
+            parentId = question.id,
+        )
+        val base = session.copy(
+            messages = session.messages.map {
+                if (it.id == question.id) it.copy(selectedChildId = assistant.id) else it
+            } + assistant,
+            updatedAt = now,
+        )
+        _active.value = base
+        upsertMeta(base)
+        startStream(base, question, assistant, prefix = null, apiKey = apiKey)
+    }
+
+    /** 切换消息版本（官方 selectVersion） */
+    fun switchVersion(messageId: String, targetId: String) {
+        val session = _active.value?.normalized() ?: return
+        val target = session.messages.find { it.id == targetId } ?: return
+        val parentId = target.parentId
+        val base = if (parentId == null) {
+            session.copy(rootMessageId = target.id, updatedAt = System.currentTimeMillis())
+        } else {
+            session.copy(
+                messages = session.messages.map {
+                    if (it.id == parentId) it.copy(selectedChildId = target.id) else it
+                },
+                updatedAt = System.currentTimeMillis(),
+            )
+        }
+        _active.value = base
+        upsertMeta(base)
+        viewModelScope.launch { persistActive(force = true) }
+    }
+
+    fun retryLast() {
+        val last = _active.value?.visibleMessages()?.lastOrNull() ?: return
+        if (last.role == "assistant" && last.status == "error") regenerate(last.id)
+    }
+
+    /** 继续生成（停止或达到长度上限的回复） */
+    fun continueLast() {
+        val session = _active.value?.normalized() ?: return
+        if (_streamingSessionId.value != null || _compressing.value) return
+        val apiKey = settings.apiKey ?: return
+        val visible = session.visibleMessages()
+        val last = visible.lastOrNull() ?: return
+        val canContinue = last.role == "assistant" &&
+            (last.status == "stopped" || (last.status == "done" && last.stopReason == "max_tokens")) &&
+            last.stopReason != "refusal" &&
+            last.blocks.none { it is ReplyBlock.Text && it.isTemplate }
+        if (!canContinue) return
+        val question = visible.dropLast(1).lastOrNull { it.role == "user" } ?: return
+        val assistant = last.copy(status = "streaming")
+        val base = session.replaceMessage(assistant)
+        _active.value = base
+        startStream(base, question, assistant, prefix = last, apiKey = apiKey)
+    }
+
+    /** 手动压缩当前对话的更早上下文（也用于验证压缩效果） */
+    fun compressContextNow() {
+        val session = _active.value?.normalized() ?: return
+        if (_streamingSessionId.value != null || _compressing.value) return
+        val apiKey = settings.apiKey ?: run { toast("请先设置 API Key"); return }
+        val history = session.visibleMessages()
+        viewModelScope.launch {
+            _compressing.value = true
+            try {
+                val plan = ContextCompressor.plan(history)
+                if (plan == null) {
+                    toast("对话不足 ${ContextCompressor.KEEP_RECENT_PAIRS} 轮，暂不需要压缩")
+                    return@launch
+                }
+                toast("正在压缩 ${plan.coveredPairs} 轮更早对话…")
+                val text = withContext(Dispatchers.IO) { SummaryApi.summarize(apiKey, plan.transcript) }.trim()
+                if (text.isBlank()) {
+                    toast("压缩结果为空，未做修改")
+                    return@launch
+                }
+                val current = _active.value ?: return@launch
+                if (current.id != session.id) return@launch
+                // 压缩期间会话可能被改动（发送/编辑），确认可见消息没变再写回
+                if (current.visibleMessages().map { it.id } != history.map { it.id }) {
+                    toast("对话已发生变化，已取消本次压缩")
+                    return@launch
+                }
+                val updated = current.copy(
+                    contextSummary = ContextSummary(
+                        text = ContextCompressor.clampSummary(text),
+                        cutoffId = plan.cutoffId,
+                        fingerprint = plan.fingerprint,
+                        covered = plan.coveredPairs,
+                        createdAt = System.currentTimeMillis(),
+                    ),
+                    updatedAt = System.currentTimeMillis(),
+                )
+                _active.value = updated
+                upsertMeta(updated)
+                persistActive(force = true)
+                toast("已压缩 ${plan.coveredPairs} 轮更早对话")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                com.dschat.app.util.AppLog.log("compress", "manual failed: ${e.message}")
+                toast("压缩失败：${e.message ?: "请稍后再试"}")
+            } finally {
+                _compressing.value = false
+            }
+        }
+    }
+
+    /** 取消压缩，之后按完整上下文发送 */
+    fun clearContextSummary() {
+        val session = _active.value ?: return
+        if (_streamingSessionId.value != null) return
+        val updated = session.copy(contextSummary = null, updatedAt = System.currentTimeMillis())
+        _active.value = updated
+        upsertMeta(updated)
+        viewModelScope.launch {
+            persistActive(force = true)
+            toast("已取消上下文压缩")
+        }
+    }
+
+    fun stop() {
+        streamJob?.cancel()
+    }
+
+    /** 发送前补传缺少 serverId 的本地原件（仅处理本次上下文范围内的消息，避免大会话全量补传） */
+    private suspend fun ensureUploaded(session: Session, scope: List<ChatMessage>): Session {
+        var result = session
+        val targets = scope.filter { it.role == "user" && it.files.any { f -> f.serverId == null && f.localPath != null } }
+        for (m in targets) {
+            val updatedFiles = m.files.toMutableList()
+            for ((i, f) in updatedFiles.withIndex()) {
+                if (f.serverId != null || f.localPath == null) continue
+                val file = store.attachmentFile(f.localPath)
+                if (!file.exists()) { updatedFiles[i] = f.copy(localPath = null); continue }
+                val raw = withContext(Dispatchers.IO) { file.readBytes() }
+                // 超大/超长图先缩到 ≤4096，避免模型报 unsupported image
+                val (bytes, mime) = if (f.isImage) com.dschat.app.util.ImageResize.maybeShrink(raw, f.mimeType) else raw to f.mimeType
+                val serverId = try {
+                    DeepSeekClient.uploadFile(
+                        settings.apiKey ?: "", f.name, mime,
+                        AttachmentRules.purposeOf(f.name, f.isImage), bytes,
+                    )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+                updatedFiles[i] = if (serverId != null) f.copy(serverId = serverId) else f.copy(localPath = null, serverId = null)
+            }
+            result = result.replaceMessage(m.copy(files = updatedFiles))
+        }
+        return result
+    }
+
+    /** 附件 file_id 失效：清空全部 serverId 以便重传 */
+    private fun Session.invalidateFileIds(): Session = copy(
+        messages = messages.map { m ->
+            if (m.role == "user" && m.files.any { it.serverId != null }) {
+                m.copy(files = m.files.map { it.copy(serverId = null) })
+            } else m
+        },
+    )
+
+    private fun startStream(
+        base: Session,
+        question: ChatMessage,
+        assistant: ChatMessage,
+        prefix: ChatMessage?,
+        apiKey: String,
+    ) {
+        val sessionId = base.id
+        _streamingSessionId.value = sessionId
+        streamJob = viewModelScope.launch {
+            var reply = assistant
+            val blockIndexes = HashMap<Int, Int>()
+            val requestTitle = base.title.isBlank()
+            var receivedContent = false
+            var attempt = 0
+            var fileRetryUsed = false
+            var finished = false
+            var currentBase = base
+            var lastUsageTotal = 0
+
+            fun pushReply() {
+                updateActive { s ->
+                    if (s.id != sessionId) s
+                    else s.copy(
+                        // 保留树字段：流式回写只更新内容，绝不覆盖 parentId / selectedChildId
+                        messages = s.messages.map {
+                            if (it.id == reply.id) reply.copy(parentId = it.parentId, selectedChildId = it.selectedChildId) else it
+                        },
+                        updatedAt = System.currentTimeMillis(),
+                    )
+                }
+            }
+
+            // 上下文接近上限时先压缩更早的对话；失败则按原样发送（绝不修改历史内容）
+            try {
+                val preVisible = currentBase.visibleMessages()
+                val preHistory = preVisible.dropLast(2)
+                if (ContextCompressor.shouldCompress(currentBase, preHistory)) {
+                    val plan = ContextCompressor.plan(preHistory)
+                    if (plan != null) {
+                        _compressing.value = true
+                        toast("上下文接近上限，正在压缩更早的对话…")
+                        try {
+                            val summaryText = withContext(Dispatchers.IO) {
+                                SummaryApi.summarize(apiKey, plan.transcript)
+                            }.trim()
+                            if (summaryText.isNotBlank()) {
+                                currentBase = currentBase.copy(
+                                    contextSummary = ContextSummary(
+                                        text = ContextCompressor.clampSummary(summaryText),
+                                        cutoffId = plan.cutoffId,
+                                        fingerprint = plan.fingerprint,
+                                        covered = plan.coveredPairs,
+                                        createdAt = System.currentTimeMillis(),
+                                    ),
+                                )
+                                _active.value = currentBase
+                                persistActive(force = true)
+                                toast("已压缩 ${plan.coveredPairs} 轮更早对话")
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            com.dschat.app.util.AppLog.log("compress", "auto failed ${e.javaClass.simpleName}: ${e.message}")
+                            toast("上下文压缩失败，本次按原样发送")
+                        } finally {
+                            _compressing.value = false
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                com.dschat.app.util.AppLog.log("compress", "precheck failed: ${e.message}")
+            }
+
+            try {
+                while (!finished) {
+                    try {
+                        // 与官方 demo 一致：全量可用轮次进入上下文（不做截断）；
+                        // 若已有有效摘要，则只发送摘要 + 截断点之后的原文
+                        val visible = currentBase.visibleMessages()
+                        val liveQuestion = visible.find { it.id == question.id } ?: question
+                        val history = visible.dropLast(2)
+                        val appliedSummary = ContextCompressor.apply(currentBase, history)
+                        val requestHistory = appliedSummary?.history ?: history
+                        val summaryText = appliedSummary?.summary
+                        // 补传附件；个别图片上传失败时跳过该图，不阻断整次发送
+                        currentBase = ensureUploaded(currentBase, requestHistory + liveQuestion)
+                        _active.value = currentBase
+                        val messages = RequestBuilder.toRequestMessages(requestHistory, liveQuestion, prefix, reply.thinking)
+                        val hasFiles = RequestBuilder.hasFileBlocks(requestHistory, liveQuestion)
+                        val body = RequestBuilder.buildBody(messages, reply.thinking, reply.search, requestTitle && currentBase.title.isBlank(), summary = summaryText)
+                        com.dschat.app.util.AppLog.log("send", "session=$sessionId thinking=${reply.thinking} search=${reply.search} historyRounds=${history.size / 2} hasFiles=$hasFiles attempt=$attempt")
+
+                        DeepSeekClient.streamMessage(apiKey, body, hasFiles).collect { event ->
+                            receivedContent = receivedContent || event is StreamEvent.BlockStart
+                            when (event) {
+                                is StreamEvent.MessageStart -> {
+                                    val total = usageTotal(event.usage)
+                                    if (total > 0) lastUsageTotal = total
+                                    com.dschat.app.util.AppLog.log("usage", "message_start ${fmtUsage(event.usage)}")
+                                }
+                                is StreamEvent.BlockStart -> {
+                                    val bt = event.block["type"]?.toString() ?: ""
+                                    if (bt.contains("server_tool_use")) {
+                                        val q = event.block["input"]?.jsonObject?.get("queries")?.jsonArray?.joinToString(",") { it.jsonPrimitive.content }
+                                        com.dschat.app.util.AppLog.log("tool", "search queries=[$q]")
+                                    } else if (bt.contains("web_search_tool_result")) {
+                                        val n = event.block["content"]?.jsonArray?.size ?: 0
+                                        com.dschat.app.util.AppLog.log("tool", "search results=$n")
+                                    } else {
+                                        com.dschat.app.util.AppLog.log("stream", "block_start idx=${event.index} type=$bt")
+                                    }
+                                }
+                                is StreamEvent.MessageDelta -> com.dschat.app.util.AppLog.log("usage", "message_delta stop=${event.stopReason} ${fmtUsage(event.usage)}")
+                                else -> {}
+                            }
+                            reply = applyEvent(reply, event, blockIndexes)
+                            if (event is StreamEvent.MessageDelta) {
+                                val title = event.title?.trim()
+                                if (!title.isNullOrBlank() && requestTitle) {
+                                    updateActive { s -> if (s.id == sessionId && s.title.isBlank()) s.copy(title = title) else s }
+                                }
+                            }
+                            pushReply()
+                            persistActive()
+                            if (event is StreamEvent.MessageStop) finished = true
+                        }
+                        if (!finished) throw ApiError(ApiErrorKind.INTERRUPTED, "")
+                        reply = settle(reply, "done")
+                        finished = true
+                        // 自动朗读：回复正常完成且开关开启时朗读正文
+                        if (_autoRead.value && reply.replyText.isNotBlank()) {
+                            val key = settings.apiKey
+                            if (key != null) tts.toggle(key, reply.id, reply.replyText, settings.ttsVoice) { }
+                        }
+                    } catch (e: CancellationException) {
+                        reply = settle(reply, "stopped")
+                        pushReply()
+                        withContext(NonCancellable) { persistActive(force = true) }
+                        throw e
+                    } catch (e: Throwable) {
+                        com.dschat.app.util.AppLog.log("error", "send failed session=$sessionId ${e.javaClass.simpleName}: ${e.message}")
+                        // 附件失效：重传一次
+                        if (!fileRetryUsed && e is ApiError && AttachmentRules.isFileIdError(e.status, e.message)) {
+                            fileRetryUsed = true
+                            currentBase = currentBase.invalidateFileIds()
+                            _active.value = currentBase
+                            continue
+                        }
+                        if (isRetryable(e) && !receivedContent && attempt < 2) {
+                            attempt += 1
+                            delay(1000L * (1 shl attempt))
+                            continue
+                        }
+                        reply = settle(reply, "error").copy(
+                            errorText = errorMessage(e),
+                            errorRetryable = isRetryable(e) || classifyError(e) == ApiCondition.UNAUTHORIZED,
+                        )
+                        finished = true
+                    }
+                }
+                if (lastUsageTotal > 0) {
+                    updateActive { s -> if (s.id == sessionId) s.copy(lastInputTokens = lastUsageTotal) else s }
+                }
+                pushReply()
+                persistActive(force = true)
+            } catch (_: CancellationException) {
+                // 用户停止
+            } finally {
+                _streamingSessionId.value = null
+                withContext(NonCancellable) { persistActive(force = true) }
+            }
+        }
+    }
+
+    private fun errorMessage(e: Throwable): String = when (classifyError(e)) {
+        ApiCondition.UNAUTHORIZED -> "API Key 无效或已被删除，请更换后重试"
+        ApiCondition.INSUFFICIENT_BALANCE -> "账户余额不足，请充值后重试"
+        ApiCondition.RATE_LIMITED -> "请求过于频繁，请稍后再试"
+        ApiCondition.SERVER_BUSY -> "服务器繁忙，请稍后再试"
+        ApiCondition.NETWORK -> "网络异常，请检查你的网络状况"
+        ApiCondition.TOO_LARGE -> "内容过长，请缩短后重试"
+        ApiCondition.OTHER -> (e.message?.takeIf { it.isNotBlank() } ?: "未知错误")
+    }
+
+    /** 上下文总量 = 输入 + 缓存命中 + 缓存写入 */
+    private fun usageTotal(u: JsonObject?): Int {
+        if (u == null) return 0
+        fun g(k: String) = u[k]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
+        return g("input_tokens") + g("cache_read_input_tokens") + g("cache_creation_input_tokens")
+    }
+
+    private fun fmtUsage(u: JsonObject?): String {
+        if (u == null) return "usage=null"
+        fun g(k: String) = u[k]?.jsonPrimitive?.content ?: "0"
+        return "in=${g("input_tokens")} out=${g("output_tokens")} cacheRead=${g("cache_read_input_tokens")} cacheWrite=${g("cache_creation_input_tokens")}"
+    }
+
+    private fun applyEvent(reply: ChatMessage, event: StreamEvent, blockIndexes: HashMap<Int, Int>): ChatMessage {
+        fun updateBlock(index: Int, transform: (ReplyBlock) -> ReplyBlock): ChatMessage {
+            val local = blockIndexes[index] ?: return reply
+            val blocks = reply.blocks.toMutableList()
+            if (local !in blocks.indices) return reply
+            blocks[local] = transform(blocks[local])
+            return reply.copy(blocks = blocks)
+        }
+
+        return when (event) {
+            is StreamEvent.MessageStart -> reply
+            is StreamEvent.BlockStart -> {
+                blockIndexes.remove(event.index)
+                val now = System.currentTimeMillis()
+                val block = event.block
+                val newBlock: ReplyBlock? = when (block.str("type")) {
+                    "text" -> ReplyBlock.Text(block.str("text") ?: "")
+                    "thinking" -> ReplyBlock.Thinking(
+                        thinking = block.str("thinking") ?: "",
+                        signature = block.str("signature"),
+                        startedAt = now,
+                    )
+                    "server_tool_use" -> {
+                        val kind = block.str("kind")
+                        if (kind == "search" || kind == "deep_search") {
+                            val queries = block["input"]?.jsonObject?.get("queries")?.jsonArray
+                                ?.mapNotNull { runCatching { it.jsonPrimitive.content }.getOrNull() } ?: emptyList()
+                            ReplyBlock.Search(queries = queries, status = "WIP")
+                        } else null
+                    }
+                    "web_search_tool_result" -> {
+                        val results = block["content"]?.jsonArray?.mapNotNull { it as? JsonObject }
+                            ?.filter { it.str("type") == "web_search_result" }
+                            ?.map { r ->
+                                SearchResult(r.str("url") ?: "", r.str("title") ?: "", r.str("snippet") ?: "", r.str("site_name"))
+                            } ?: emptyList()
+                        val failed = block["content"]?.jsonArray?.any {
+                            (it as? JsonObject)?.str("type") == "web_search_tool_result_error"
+                        } ?: false
+                        val blocks = reply.blocks.toMutableList()
+                        val idx = blocks.indexOfLast { it is ReplyBlock.Search && it.status == "WIP" }
+                        if (idx >= 0) {
+                            blocks[idx] = (blocks[idx] as ReplyBlock.Search).copy(
+                                results = results, status = if (failed) "FAILED" else "FINISHED",
+                            )
+                            return reply.copy(blocks = blocks)
+                        }
+                        ReplyBlock.Search(results = results, status = if (failed) "FAILED" else "FINISHED")
+                    }
+                    else -> null
+                }
+                if (newBlock == null) return reply
+                blockIndexes[event.index] = reply.blocks.size
+                reply.copy(blocks = reply.blocks + newBlock)
+            }
+            is StreamEvent.BlockDelta -> {
+                val delta = event.delta
+                when (delta.str("type")) {
+                    "text_delta" -> updateBlock(event.index) { b ->
+                        if (b is ReplyBlock.Text) b.copy(text = b.text + (delta.str("text") ?: "")) else b
+                    }
+                    "thinking_delta" -> updateBlock(event.index) { b ->
+                        if (b is ReplyBlock.Thinking) b.copy(thinking = b.thinking + (delta.str("thinking") ?: "")) else b
+                    }
+                    "signature_delta" -> updateBlock(event.index) { b ->
+                        if (b is ReplyBlock.Thinking) b.copy(signature = (b.signature ?: "") + (delta.str("signature") ?: "")) else b
+                    }
+                    else -> reply
+                }
+            }
+            is StreamEvent.BlockStop -> updateBlock(event.index) { b ->
+                if (b is ReplyBlock.Thinking && b.startedAt != null && b.endedAt == null) {
+                    b.copy(endedAt = System.currentTimeMillis())
+                } else b
+            }
+            is StreamEvent.MessageDelta -> reply.copy(stopReason = event.stopReason ?: reply.stopReason)
+            is StreamEvent.MessageStop -> reply
+        }
+    }
+
+    private fun settle(reply: ChatMessage, status: String): ChatMessage {
+        val now = System.currentTimeMillis()
+        val refusal = reply.stopReason == "refusal"
+        var blocks = reply.blocks.map { b ->
+            if (b is ReplyBlock.Thinking && b.startedAt != null && b.endedAt == null) b.copy(endedAt = now) else b
+        }
+        if (refusal) {
+            blocks = blocks.filter { it !is ReplyBlock.Thinking && it !is ReplyBlock.Text }
+            blocks = blocks + ReplyBlock.Text("你好，这个问题我暂时无法回答，让我们换个话题再聊聊吧。", isTemplate = true)
+        }
+        return reply.copy(status = if (refusal) "refusal" else status, blocks = blocks)
+    }
+
+    private fun JsonObject.str(key: String): String? =
+        this[key]?.takeIf { it !is kotlinx.serialization.json.JsonNull }?.jsonPrimitive?.content
+
+    // ------------------------------------------------------------ import / export
+
+    /** 导入历史对话 ZIP（覆盖全部本地会话，含图片原件与消息分支） */
+    suspend fun importArchive(openStream: () -> InputStream): Int = withContext(Dispatchers.IO) {
+        _busy.value = true
+        try {
+            // 先清旧附件，再提取新原件（replaceAll 只替换会话，不动附件）
+            store.clearAttachments()
+            val sessions = HistoryArchive.import(openStream) { entryName, bytes ->
+                // 条目名 chat_sessions/{sid}_files/{fid}_{name}
+                val sid = entryName.removePrefix("chat_sessions/").substringBefore("_files/")
+                val fid = entryName.substringAfterLast("/").substringBefore("_")
+                store.saveAttachment(sid, fid, entryName.substringAfterLast("/"), bytes)
+            }
+            stop()
+            store.replaceAll(sessions)
+            withContext(Dispatchers.Main) {
+                _active.value = null
+                _drafts.value = emptyList()
+            }
+            refreshMetas()
+            sessions.size
+        } finally {
+            _busy.value = false
+        }
+    }
+
+    /** 从官方导出链接下载 ZIP 并导入（华为云 OBS 等签名直链） */
+    suspend fun importFromUrl(url: String): Int = withContext(Dispatchers.IO) {
+        val trimmed = url.trim()
+        if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+            throw IllegalArgumentException("链接无效，请粘贴完整的导出链接")
+        }
+        val context = getApplication<DeepSeekApp>()
+        val temp = File.createTempFile("ds_link", ".zip", context.cacheDir)
+        try {
+            val client = OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(180, TimeUnit.SECONDS)
+                .build()
+            val request = Request.Builder().url(trimmed).get().build()
+            client.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) throw IOException("下载失败：HTTP ${resp.code}")
+                temp.outputStream().use { out ->
+                    resp.body?.byteStream()?.copyTo(out) ?: throw IOException("下载内容为空")
+                }
+            }
+            importArchive { temp.inputStream() }
+        } finally {
+            temp.delete()
+        }
+    }
+
+    suspend fun exportArchive(output: OutputStream) = withContext(Dispatchers.IO) {
+        _busy.value = true
+        try {
+            val metas = store.listMetas()
+            val sessions = metas.mapNotNull { store.load(it.id)?.normalized() }
+            if (sessions.isEmpty()) throw IllegalStateException("没有可导出的对话")
+            HistoryArchive.export(sessions, { f ->
+                f.localPath?.let { p ->
+                    val file = store.attachmentFile(p)
+                    if (file.exists()) runCatching { file.readBytes() }.getOrNull() else null
+                }
+            }, output)
+        } finally {
+            _busy.value = false
+        }
+    }
+
+    /** 附件原件文件（供缩略图加载） */
+    fun attachmentFile(relPath: String): File = store.attachmentFile(relPath)
+
+    /** 导出单个对话为 JSON（含附件 base64） */
+    suspend fun exportSessionJson(id: String, output: OutputStream) = withContext(Dispatchers.IO) {
+        val session = store.load(id)?.normalized() ?: throw IllegalStateException("对话不存在")
+        val text = SessionJson.export(session) { p ->
+            val f = store.attachmentFile(p)
+            if (f.exists()) runCatching { f.readBytes() }.getOrNull() else null
+        }
+        output.write(text.toByteArray(Charsets.UTF_8))
+    }
+
+    /** 生成单个对话 JSON 缓存文件（供反馈邮件附件） */
+    suspend fun sessionJsonFile(id: String): File? = withContext(Dispatchers.IO) {
+        val session = store.load(id)?.normalized() ?: return@withContext null
+        val text = SessionJson.export(session) { p ->
+            val f = store.attachmentFile(p)
+            if (f.exists()) runCatching { f.readBytes() }.getOrNull() else null
+        }
+        val out = File(getApplication<DeepSeekApp>().cacheDir, "feedback-session-$id.json")
+        out.writeText(text)
+        out
+    }
+
+    /** 导入单个对话 JSON：合并为新会话（不覆盖现有），返回新会话 id */
+    suspend fun importSessionJson(openStream: () -> InputStream): String = withContext(Dispatchers.IO) {
+        _busy.value = true
+        try {
+            val text = openStream().bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val newId = SessionStore.newId()
+            val session = SessionJson.import(text, newId) { fid, name, bytes ->
+                store.saveAttachment(newId, fid, name, bytes)
+            }
+            store.save(session)
+            com.dschat.app.util.AppLog.log("import", "single json -> newId=$newId msgs=${session.messages.size}")
+            refreshMetas()
+            newId
+        } finally {
+            _busy.value = false
+        }
+    }
+
+    // ------------------------------------------------------------ in-app update
+
+    private val _updateInfo = MutableStateFlow<UpdateChecker.UpdateInfo?>(null)
+    val updateInfo: StateFlow<UpdateChecker.UpdateInfo?> = _updateInfo
+
+    private val _updateProgress = MutableStateFlow<Float?>(null)
+    val updateProgress: StateFlow<Float?> = _updateProgress
+
+    private val _downloadedApk = MutableStateFlow<File?>(null)
+    val downloadedApk: StateFlow<File?> = _downloadedApk
+
+    private val _updateError = MutableStateFlow<String?>(null)
+    val updateError: StateFlow<String?> = _updateError
+
+    private var updateJob: Job? = null
+
+    fun checkUpdate(manual: Boolean) {
+        if (updateJob?.isActive == true) return
+        updateJob = viewModelScope.launch {
+            try {
+                val info = UpdateChecker.fetchLatest()
+                if (info != null && UpdateChecker.isNewer(info.version, BuildConfig.VERSION_NAME)) {
+                    _updateInfo.value = info
+                    _updateError.value = null
+                } else if (manual) {
+                    toast("已是最新版本（v${BuildConfig.VERSION_NAME}）")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (manual) toast("检查更新失败：${e.message ?: "网络异常"}")
+            }
+        }
+    }
+
+    fun dismissUpdate() {
+        updateJob?.cancel()
+        _updateInfo.value = null
+        _updateProgress.value = null
+        _updateError.value = null
+    }
+
+    fun downloadUpdate(context: Context) {
+        val info = _updateInfo.value ?: return
+        if (updateJob?.isActive == true) return
+        updateJob = viewModelScope.launch {
+            _updateProgress.value = 0f
+            _updateError.value = null
+            try {
+                val file = UpdateChecker.download(context.applicationContext, info) { p ->
+                    _updateProgress.value = p
+                }
+                _downloadedApk.value = file
+                _updateProgress.value = null
+                installUpdate(context)
+            } catch (e: CancellationException) {
+                _updateProgress.value = null
+                throw e
+            } catch (e: Exception) {
+                _updateProgress.value = null
+                _updateError.value = "下载失败：${e.message ?: "网络异常"}"
+            }
+        }
+    }
+
+    fun cancelDownload() {
+        updateJob?.cancel()
+        _updateProgress.value = null
+    }
+
+    fun installUpdate(context: Context) {
+        val file = _downloadedApk.value ?: return
+        if (Build.VERSION.SDK_INT >= 26 && !context.packageManager.canRequestPackageInstalls()) {
+            runCatching {
+                context.startActivity(
+                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            }
+            toast("请允许安装未知应用，返回后点击「安装」")
+            return
+        }
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        runCatching {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                },
+            )
+        }.onFailure { toast("无法启动安装器：${it.message}") }
+    }
+}
