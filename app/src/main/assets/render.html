@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="katex/katex.min.css">
+<style>
+  :root{ --fg:#1a1a1a; --bg:transparent; --accent:#3964fe; --border:#e5e5e5; --code-bg:#f5f5f5; }
+  html,body{ margin:0; padding:0; background:var(--bg); }
+  body{ color:var(--fg); font-size:15px; line-height:1.65; font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; word-wrap:break-word; overflow-wrap:break-word; }
+  #content{ padding:2px 0; }
+  p{ margin:0 0 10px; }
+  h1,h2,h3,h4{ margin:14px 0 8px; line-height:1.3; }
+  h1{font-size:22px} h2{font-size:19px} h3{font-size:17px}
+  ul,ol{ margin:0 0 10px; padding-left:22px; }
+  li{ margin:2px 0; }
+  a{ color:var(--accent); }
+  code{ background:var(--code-bg); border-radius:4px; padding:1px 5px; font-size:13px; font-family:ui-monospace,Consolas,monospace; }
+  pre{ background:var(--code-bg); border-radius:8px; padding:10px; overflow-x:auto; }
+  pre code{ background:none; padding:0; }
+  blockquote{ border-left:3px solid var(--border); margin:0 0 10px; padding:2px 12px; opacity:.8; }
+  table{ border-collapse:collapse; margin:0 0 10px; display:block; overflow-x:auto; max-width:100%; }
+  th,td{ border:1px solid var(--border); padding:5px 10px; font-size:13px; }
+  img{ max-width:100%; }
+  hr{ border:none; border-top:1px solid var(--border); margin:12px 0; }
+  .katex-display{ overflow-x:auto; overflow-y:hidden; padding:2px 0; }
+  .katex{ font-size:1.05em; }
+  .mermaid{ background:var(--code-bg); border-radius:8px; padding:8px; margin:0 0 10px; text-align:center; }
+  .mermaid svg{ max-width:100%; }
+</style>
+</head>
+<body>
+<div id="content"></div>
+<script src="markdown-it.min.js"></script>
+<script>
+  var md = window.markdownit({ html:false, linkify:true, breaks:true });
+  var defaultFence = md.renderer.rules.fence || function(tokens,idx,opt,env,self){ return self.renderToken(tokens,idx,opt); };
+  md.renderer.rules.fence = function(tokens,idx,opt,env,self){
+    var t = tokens[idx];
+    if (t.info.trim().toLowerCase() === 'mermaid') return '<div class="mermaid">' + md.utils.escapeHtml(t.content) + '</div>';
+    return defaultFence(tokens,idx,opt,env,self);
+  };
+
+  // ---- 按需加载：KaTeX 只在出现公式时加载，mermaid 只在出现 ```mermaid 时加载 ----
+  // 之前无条件加载 3.2MB mermaid + 600KB KaTeX，每条回复一个 WebView、滚动重建时全部重解析，是长会话卡顿主因。
+  var assetState = { katex: 'idle', mermaid: 'idle' };
+  var waiters = { katex: [], mermaid: [] };
+  function loadAssets(name, files, done){
+    var st = assetState[name];
+    if (st === 'ready') { done(); return; }
+    waiters[name].push(done);
+    if (st === 'loading') return;
+    assetState[name] = 'loading';
+    (function next(i){
+      if (i >= files.length) {
+        assetState[name] = 'ready';
+        var list = waiters[name]; waiters[name] = [];
+        list.forEach(function(fn){ try { fn(); } catch(e) {} });
+        return;
+      }
+      var s = document.createElement('script');
+      s.src = files[i];
+      s.onload = function(){ next(i + 1); };
+      s.onerror = function(){
+        assetState[name] = 'error';
+        var list = waiters[name]; waiters[name] = [];
+        list.forEach(function(fn){ try { fn(); } catch(e) {} });
+      };
+      document.head.appendChild(s);
+    })(0);
+  }
+  var katexReady = false, mermaidReady = false;
+  function ensureKatex(cb){
+    loadAssets('katex', ['katex/katex.min.js', 'katex/auto-render.min.js'], function(){
+      katexReady = (assetState.katex === 'ready'); cb();
+    });
+  }
+  function ensureMermaid(cb){
+    loadAssets('mermaid', ['mermaid.min.js'], function(){
+      if (assetState.mermaid === 'ready') {
+        if (!mermaidReady) {
+          try { mermaid.initialize({ startOnLoad:false, theme:'neutral', securityLevel:'loose' }); mermaidReady = true; } catch(e) {}
+        }
+      }
+      cb();
+    });
+  }
+
+  function reportHeight(){
+    var h = document.body.scrollHeight;
+    if (window.Android && window.Android.setHeight) window.Android.setHeight(h);
+  }
+  function scheduleHeight(){
+    requestAnimationFrame(reportHeight);
+    setTimeout(reportHeight, 60);
+    setTimeout(reportHeight, 250);
+  }
+  window.setTheme = function(fg, bg, accent, border, codeBg){
+    var r = document.documentElement.style;
+    r.setProperty('--fg', fg); r.setProperty('--bg', bg); r.setProperty('--accent', accent);
+    r.setProperty('--border', border); r.setProperty('--code-bg', codeBg);
+  };
+
+  var MATH_RE = /\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$[^$\n]+?\$/g;
+  var HAS_MATH_RE = /\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$[^$\n]+?\$/;
+  window.renderMarkdown = function(text){
+    var el = document.getElementById('content');
+    var src = text || '';
+    var stash = [];
+    var prot = src.replace(MATH_RE, function(m){
+      stash.push(m);
+      return '@@KTX' + (stash.length - 1) + '@@';
+    });
+    var html = md.render(prot);
+    html = html.replace(/@@KTX(\d+)@@/g, function (_, i) { return md.utils.escapeHtml(stash[+i]); });
+    el.innerHTML = html;
+
+    if (HAS_MATH_RE.test(src)) {
+      ensureKatex(function(){
+        if (!katexReady) { scheduleHeight(); return; }
+        try {
+          renderMathInElement(el, { delimiters: [
+            { left: '$$', right: '$$', display: true },
+            { left: '$', right: '$', display: false }
+          ], throwOnError: false });
+        } catch (e) {}
+        scheduleHeight();
+      });
+    }
+    if (el.querySelectorAll('.mermaid').length > 0) {
+      ensureMermaid(function(){
+        if (!mermaidReady) { scheduleHeight(); return; }
+        try { mermaid.run({ nodes: el.querySelectorAll('.mermaid') }); } catch (e) {}
+        scheduleHeight();
+      });
+    }
+    scheduleHeight();
+  };
+  if (window.ResizeObserver) { new ResizeObserver(function () { reportHeight(); }).observe(document.body); }
+  window.addEventListener('load', reportHeight);
+</script>
+</body>
+</html>

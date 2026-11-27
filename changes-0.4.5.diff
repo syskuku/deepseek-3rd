@@ -1,0 +1,1216 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index d354e93..df898bd 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -10,7 +10,10 @@ android {
+     compileSdk = 35
+ 
+     defaultConfig {
+-        applicationId = "com.dschat.app"
++        // 本地测试可传 -PappIdSuffix=.test 与正式包共存，不覆盖已安装版本
++        val appIdSuffix = (project.findProperty("appIdSuffix") as String?) ?: ""
++        applicationId = "com.dschat.app$appIdSuffix"
++        manifestPlaceholders["appLabel"] = if (appIdSuffix.isEmpty()) "DeepSeek(3rd)" else "DeepSeek(3rd)测试"
+         minSdk = 26
+         targetSdk = 35
+         versionCode = 22
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 40101f7..ae5ff4a 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -13,7 +13,7 @@
+         android:allowBackup="false"
+         android:icon="@mipmap/ic_launcher"
+         android:roundIcon="@mipmap/ic_launcher_round"
+-        android:label="@string/app_name"
++        android:label="${appLabel}"
+         android:supportsRtl="true"
+         android:theme="@style/Theme.DeepSeekChat">
+ 
+diff --git a/app/src/main/assets/render.html b/app/src/main/assets/render.html
+index 2e6ffea..6c8e422 100644
+--- a/app/src/main/assets/render.html
++++ b/app/src/main/assets/render.html
+@@ -31,10 +31,7 @@
+ </head>
+ <body>
+ <div id="content"></div>
+-<script src="katex/katex.min.js"></script>
+-<script src="katex/auto-render.min.js"></script>
+ <script src="markdown-it.min.js"></script>
+-<script src="mermaid.min.js"></script>
+ <script>
+   var md = window.markdownit({ html:false, linkify:true, breaks:true });
+   var defaultFence = md.renderer.rules.fence || function(tokens,idx,opt,env,self){ return self.renderToken(tokens,idx,opt); };
+@@ -43,39 +40,101 @@
+     if (t.info.trim().toLowerCase() === 'mermaid') return '<div class="mermaid">' + md.utils.escapeHtml(t.content) + '</div>';
+     return defaultFence(tokens,idx,opt,env,self);
+   };
+-  var mermaidReady = false;
+-  try { mermaid.initialize({ startOnLoad:false, theme:'neutral', securityLevel:'loose' }); mermaidReady = true; } catch(e){}
++
++  // ---- 按需加载：KaTeX 只在出现公式时加载，mermaid 只在出现 ```mermaid 时加载 ----
++  // 之前无条件加载 3.2MB mermaid + 600KB KaTeX，每条回复一个 WebView、滚动重建时全部重解析，是长会话卡顿主因。
++  var assetState = { katex: 'idle', mermaid: 'idle' };
++  var waiters = { katex: [], mermaid: [] };
++  function loadAssets(name, files, done){
++    var st = assetState[name];
++    if (st === 'ready') { done(); return; }
++    waiters[name].push(done);
++    if (st === 'loading') return;
++    assetState[name] = 'loading';
++    (function next(i){
++      if (i >= files.length) {
++        assetState[name] = 'ready';
++        var list = waiters[name]; waiters[name] = [];
++        list.forEach(function(fn){ try { fn(); } catch(e) {} });
++        return;
++      }
++      var s = document.createElement('script');
++      s.src = files[i];
++      s.onload = function(){ next(i + 1); };
++      s.onerror = function(){
++        assetState[name] = 'error';
++        var list = waiters[name]; waiters[name] = [];
++        list.forEach(function(fn){ try { fn(); } catch(e) {} });
++      };
++      document.head.appendChild(s);
++    })(0);
++  }
++  var katexReady = false, mermaidReady = false;
++  function ensureKatex(cb){
++    loadAssets('katex', ['katex/katex.min.js', 'katex/auto-render.min.js'], function(){
++      katexReady = (assetState.katex === 'ready'); cb();
++    });
++  }
++  function ensureMermaid(cb){
++    loadAssets('mermaid', ['mermaid.min.js'], function(){
++      if (assetState.mermaid === 'ready') {
++        if (!mermaidReady) {
++          try { mermaid.initialize({ startOnLoad:false, theme:'neutral', securityLevel:'loose' }); mermaidReady = true; } catch(e) {}
++        }
++      }
++      cb();
++    });
++  }
+ 
+   function reportHeight(){
+     var h = document.body.scrollHeight;
+     if (window.Android && window.Android.setHeight) window.Android.setHeight(h);
+   }
++  function scheduleHeight(){
++    requestAnimationFrame(reportHeight);
++    setTimeout(reportHeight, 60);
++    setTimeout(reportHeight, 250);
++  }
+   window.setTheme = function(fg, bg, accent, border, codeBg){
+     var r = document.documentElement.style;
+     r.setProperty('--fg', fg); r.setProperty('--bg', bg); r.setProperty('--accent', accent);
+     r.setProperty('--border', border); r.setProperty('--code-bg', codeBg);
+   };
++
+   var MATH_RE = /\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$[^$\n]+?\$/g;
++  var HAS_MATH_RE = /\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$[^$\n]+?\$/;
+   window.renderMarkdown = function(text){
+     var el = document.getElementById('content');
++    var src = text || '';
+     var stash = [];
+-    var prot = (text||'').replace(MATH_RE, function(m){
++    var prot = src.replace(MATH_RE, function(m){
+       stash.push(m);
+       return '@@KTX' + (stash.length - 1) + '@@';
+     });
+     var html = md.render(prot);
+     html = html.replace(/@@KTX(\d+)@@/g, function (_, i) { return md.utils.escapeHtml(stash[+i]); });
+     el.innerHTML = html;
+-    try {
+-      renderMathInElement(el, { delimiters: [
+-        { left: '$$', right: '$$', display: true },
+-        { left: '$', right: '$', display: false }
+-      ], throwOnError: false });
+-    } catch (e) {}
+-    if (mermaidReady) { try { mermaid.run({ nodes: el.querySelectorAll('.mermaid') }); } catch (e) {} }
+-    requestAnimationFrame(reportHeight);
+-    setTimeout(reportHeight, 60);
+-    setTimeout(reportHeight, 250);
++
++    if (HAS_MATH_RE.test(src)) {
++      ensureKatex(function(){
++        if (!katexReady) { scheduleHeight(); return; }
++        try {
++          renderMathInElement(el, { delimiters: [
++            { left: '$$', right: '$$', display: true },
++            { left: '$', right: '$', display: false }
++          ], throwOnError: false });
++        } catch (e) {}
++        scheduleHeight();
++      });
++    }
++    if (el.querySelectorAll('.mermaid').length > 0) {
++      ensureMermaid(function(){
++        if (!mermaidReady) { scheduleHeight(); return; }
++        try { mermaid.run({ nodes: el.querySelectorAll('.mermaid') }); } catch (e) {}
++        scheduleHeight();
++      });
++    }
++    scheduleHeight();
+   };
+   if (window.ResizeObserver) { new ResizeObserver(function () { reportHeight(); }).observe(document.body); }
+   window.addEventListener('load', reportHeight);
+diff --git a/app/src/main/java/com/dschat/app/data/ContextCompressor.kt b/app/src/main/java/com/dschat/app/data/ContextCompressor.kt
+new file mode 100644
+index 0000000..604b459
+--- /dev/null
++++ b/app/src/main/java/com/dschat/app/data/ContextCompressor.kt
+@@ -0,0 +1,136 @@
++package com.dschat.app.data
++
++import java.security.MessageDigest
++
++/**
++ * 上下文压缩的纯逻辑（无 Android / 网络依赖，便于单测）。
++ *
++ * 策略：
++ * - 只压缩「用户提问 + 可用回答」的配对，保留最近 [KEEP_RECENT_PAIRS] **轮**原文；
++ * - 摘要覆盖到被压缩部分的最后一条消息（cutoffId），并用前缀指纹校验；
++ * - 分支切换 / 编辑 / 删除导致前缀变化时校验失败，摘要自动失效（按原样发送或重新压缩）。
++ */
++object ContextCompressor {
++
++    /** 模型上下文上限（deepseek-flash）。超过 [TRIGGER_RATIO] 时触发压缩。 */
++    const val CONTEXT_LIMIT_TOKENS = 128_000
++    const val TRIGGER_RATIO = 0.95
++
++    /** 压缩后保留的最近原文轮数（1 轮 = 用户提问 + 助手回答） */
++    const val KEEP_RECENT_PAIRS = 50
++
++    /** 摘要最多保留的字数（防止摘要本身过长） */
++    const val MAX_SUMMARY_CHARS = 18_000
++
++    /** 触发压缩所需的最小压缩轮数（太短不值得调用模型） */
++    const val MIN_COVERED_PAIRS = 2
++
++    data class Plan(
++        val transcript: String,
++        val cutoffId: String,
++        val fingerprint: String,
++        val coveredPairs: Int,
++    )
++
++    data class Applied(
++        val history: List<ChatMessage>,
++        val summary: String,
++        val covered: Int,
++    )
++
++    /** 与 RequestBuilder.toRequestMessages 相同的配对规则 */
++    fun pairs(history: List<ChatMessage>): List<Pair<ChatMessage, ChatMessage>> {
++        val out = ArrayList<Pair<ChatMessage, ChatMessage>>()
++        var i = 0
++        while (i + 1 < history.size) {
++            val user = history[i]
++            val reply = history[i + 1]
++            if (user.role == "user" && reply.isUsableReply) {
++                val hasText = user.content.isNotBlank()
++                val hasFiles = user.files.any { it.serverId != null } || user.files.isNotEmpty()
++                if (hasText || hasFiles) { out.add(user to reply); i += 2; continue }
++            }
++            i += 1
++        }
++        return out
++    }
++
++    /** 估算上下文 token 数（偏保守：中文约 1.6 字符/token，并预留 system 开销） */
++    fun estimateTokens(history: List<ChatMessage>): Int {
++        var chars = 0
++        history.forEach { m ->
++            if (m.role == "user") {
++                chars += m.content.length
++                m.files.forEach { chars += it.name.length + 32 }
++            } else {
++                m.blocks.forEach { b ->
++                    if (b is ReplyBlock.Text && !b.isTemplate) chars += b.text.length
++                }
++            }
++        }
++        return (chars / 1.6).toInt() + 1500
++    }
++
++    fun fingerprint(ids: List<String>): String {
++        val md = MessageDigest.getInstance("SHA-256")
++        val bytes = md.digest(ids.joinToString("\n").toByteArray(Charsets.UTF_8))
++        val sb = StringBuilder(bytes.size * 2)
++        bytes.forEach { sb.append("%02x".format(it)) }
++        return sb.toString()
++    }
++
++    /** 摘要是否仍然匹配当前分支（cutoff 存在且前缀指纹一致） */
++    fun apply(session: Session, history: List<ChatMessage>): Applied? {
++        val summary = session.contextSummary ?: return null
++        val idx = history.indexOfFirst { it.id == summary.cutoffId }
++        if (idx < 0) return null
++        val ids = history.take(idx + 1).map { it.id }
++        if (fingerprint(ids) != summary.fingerprint) return null
++        return Applied(history.drop(idx + 1), summary.text, summary.covered)
++    }
++
++    /** 是否需要压缩：已有有效摘要则不需要；否则按上次服务端回报与估算值取大者判断 */
++    fun shouldCompress(session: Session, history: List<ChatMessage>): Boolean {
++        if (apply(session, history) != null) return false
++        val used = maxOf(session.lastInputTokens, estimateTokens(history))
++        return used >= (CONTEXT_LIMIT_TOKENS * TRIGGER_RATIO).toInt()
++    }
++
++    /**
++     * 生成压缩计划；返回 null 表示不需要/无法压缩。
++     * [keepPairs] 为保留原文的最近轮数（默认 50 轮）。
++     */
++    fun plan(history: List<ChatMessage>, keepPairs: Int = KEEP_RECENT_PAIRS): Plan? {
++        val all = pairs(history)
++        val keep = keepPairs.coerceAtLeast(0)
++        // 必须至少留下 MIN_COVERED_PAIRS 轮可压缩
++        if (all.size - keep < MIN_COVERED_PAIRS) return null
++        val covered = all.dropLast(keep)
++        if (covered.size < MIN_COVERED_PAIRS) return null
++
++        val coveredIds = ArrayList<String>()
++        val sb = StringBuilder()
++        covered.forEach { (user, reply) ->
++            coveredIds.add(user.id)
++            coveredIds.add(reply.id)
++            val question = if (user.content.isNotBlank()) user.content else "（发送了附件）"
++            val files = if (user.files.isNotEmpty()) "\n[附件：" + user.files.joinToString("、") { it.name } + "]" else ""
++            sb.append("用户：").append(question).append(files).append('\n')
++            sb.append("助手：").append(reply.replyText).append("\n\n")
++        }
++        val cutoffId = coveredIds.last()
++        val cutoffIdx = history.indexOfFirst { it.id == cutoffId }
++        if (cutoffIdx < 0) return null
++        // 指纹按 history 前缀计算，保证 apply() 能一致复现（跳过残轮等）
++        val prefixIds = history.take(cutoffIdx + 1).map { it.id }
++        return Plan(
++            transcript = sb.toString().trim(),
++            cutoffId = cutoffId,
++            fingerprint = fingerprint(prefixIds),
++            coveredPairs = covered.size,
++        )
++    }
++
++    fun clampSummary(text: String): String =
++        if (text.length <= MAX_SUMMARY_CHARS) text else text.take(MAX_SUMMARY_CHARS) + "…"
++}
+diff --git a/app/src/main/java/com/dschat/app/data/Models.kt b/app/src/main/java/com/dschat/app/data/Models.kt
+index 07d2d55..c5e17be 100644
+--- a/app/src/main/java/com/dschat/app/data/Models.kt
++++ b/app/src/main/java/com/dschat/app/data/Models.kt
+@@ -94,6 +94,19 @@ data class ChatMessage(
+             replyText.isNotEmpty()
+ }
+ 
++/** 自动上下文压缩的结果（覆盖 cutoffId 及其之前的对话） */
++@Serializable
++data class ContextSummary(
++    val text: String,
++    /** 被压缩部分的最后一条消息 id（该消息及其之前的内容已被摘要替代） */
++    val cutoffId: String,
++    /** 被压缩前缀的指纹，用于校验摘要是否仍与当前分支一致 */
++    val fingerprint: String,
++    /** 被压缩的对话轮数（问答对） */
++    val covered: Int,
++    val createdAt: Long = 0L,
++)
++
+ @Serializable
+ data class Session(
+     val id: String,
+@@ -102,6 +115,10 @@ data class Session(
+     val updatedAt: Long,
+     val messages: List<ChatMessage>,
+     val rootMessageId: String? = null,
++    /** 上下文压缩摘要；为空表示未压缩 */
++    val contextSummary: ContextSummary? = null,
++    /** 上一次请求服务端回报的上下文 token 数（input + cache read + cache write） */
++    val lastInputTokens: Int = 0,
+ ) {
+     fun meta() = SessionMeta(id, title, createdAt, updatedAt)
+ 
+diff --git a/app/src/main/java/com/dschat/app/data/SessionJson.kt b/app/src/main/java/com/dschat/app/data/SessionJson.kt
+index c1db3c5..4321121 100644
+--- a/app/src/main/java/com/dschat/app/data/SessionJson.kt
++++ b/app/src/main/java/com/dschat/app/data/SessionJson.kt
+@@ -47,7 +47,10 @@ object SessionJson {
+         val att = root["attachments"]?.jsonObject ?: JsonObject(emptyMap())
+         val remap = HashMap<String, String>()
+         val newMessages = session.messages.map { m ->
+-            m.copy(files = m.files.map { f ->
++            // 导出时正在生成的消息可能停在 pending/streaming；导入后不可能继续流式，归一为「已中断」，
++            // 否则界面会一直按流式渲染（不能重新生成/继续，且滚动高度反复变化）。
++            val status = if (m.status == "pending" || m.status == "streaming") "stopped" else m.status
++            m.copy(status = status, files = m.files.map { f ->
+                 val p = f.localPath
+                 if (p != null && att.containsKey(p)) {
+                     val newPath = remap.getOrPut(p) {
+diff --git a/app/src/main/java/com/dschat/app/net/RequestBuilder.kt b/app/src/main/java/com/dschat/app/net/RequestBuilder.kt
+index 9836395..733828f 100644
+--- a/app/src/main/java/com/dschat/app/net/RequestBuilder.kt
++++ b/app/src/main/java/com/dschat/app/net/RequestBuilder.kt
+@@ -160,14 +160,23 @@ object RequestBuilder {
+         thinking: Boolean,
+         search: Boolean,
+         requestTitle: Boolean,
++        /** 早期对话的摘要（上下文压缩后），作为 system 的附加块随请求发送 */
++        summary: String? = null,
+     ): JsonObject = buildJsonObject {
+         put("model", DeepSeekClient.MODEL)
+-        // system 块数组 + 缓存断点，确定性命中 prompt caching
++        // system 块数组 + 缓存断点（放在最后一块上），确定性命中 prompt caching
++        val systemTexts = ArrayList<String>()
++        systemTexts.add(DeepSeekClient.SYSTEM_PROMPT)
++        if (!summary.isNullOrBlank()) {
++            systemTexts.add("【更早对话的摘要（自动压缩，原文已省略）】\n" + summary.trim())
++        }
+         putJsonArray("system") {
+-            addJsonObject {
+-                put("type", "text")
+-                put("text", DeepSeekClient.SYSTEM_PROMPT)
+-                putJsonObject("cache_control") { put("type", "ephemeral") }
++            systemTexts.forEachIndexed { i, text ->
++                addJsonObject {
++                    put("type", "text")
++                    put("text", text)
++                    if (i == systemTexts.lastIndex) putJsonObject("cache_control") { put("type", "ephemeral") }
++                }
+             }
+         }
+         put("messages", messages)
+diff --git a/app/src/main/java/com/dschat/app/net/SummaryApi.kt b/app/src/main/java/com/dschat/app/net/SummaryApi.kt
+new file mode 100644
+index 0000000..cfcfdd7
+--- /dev/null
++++ b/app/src/main/java/com/dschat/app/net/SummaryApi.kt
+@@ -0,0 +1,57 @@
++package com.dschat.app.net
++
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.addJsonObject
++import kotlinx.serialization.json.buildJsonArray
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.contentOrNull
++import kotlinx.serialization.json.jsonPrimitive
++import kotlinx.serialization.json.put
++import kotlinx.serialization.json.putJsonArray
++import kotlinx.serialization.json.putJsonObject
++
++/**
++ * 用同一个模型把较早的对话压缩成摘要（一次性、流式收集正文）。
++ * 失败由调用方兜底：压缩失败时按原样发送，不修改会话。
++ */
++object SummaryApi {
++
++    const val PROMPT = """你是对话上下文压缩助手。请把下面这段「用户与助手的历史对话」压缩成一段简洁、客观的中文摘要。
++
++要求：
++1. 保留：对话目标与背景、关键事实与数据、已确认的结论或决定、重要约束与偏好、尚未完成的事项。
++2. 删除：寒暄、重复内容、思考过程、搜索结果列表、无关细节。
++3. 不要编造对话中没有的信息，不要添加评论或建议。
++4. 直接输出摘要正文（可以用短标题和项目符号），不要写「以下是摘要」之类的前言。
++5. 摘要会替代原文继续参与后续对话，信息要尽量完整：篇幅上限 18000 字，请充分展开，不要为了简短丢信息。"""
++
++    suspend fun summarize(apiKey: String, transcript: String): String {
++        val body: JsonObject = buildJsonObject {
++            put("model", DeepSeekClient.MODEL)
++            putJsonArray("system") {
++                addJsonObject {
++                    put("type", "text")
++                    put("text", PROMPT)
++                }
++            }
++            putJsonArray("messages") {
++                addJsonObject {
++                    put("role", "user")
++                    put("content", "以下是需要压缩的历史对话：\n\n$transcript")
++                }
++            }
++            putJsonObject("thinking") { put("type", "disabled") }
++            put("stream", true)
++        }
++        val sb = StringBuilder()
++        DeepSeekClient.streamMessage(apiKey, body).collect { event ->
++            if (event is StreamEvent.BlockDelta) {
++                val delta = event.delta
++                if (delta["type"]?.jsonPrimitive?.contentOrNull == "text_delta") {
++                    sb.append(delta["text"]?.jsonPrimitive?.contentOrNull ?: "")
++                }
++            }
++        }
++        return sb.toString().trim()
++    }
++}
+diff --git a/app/src/main/java/com/dschat/app/ui/ChatScreen.kt b/app/src/main/java/com/dschat/app/ui/ChatScreen.kt
+index 61d714d..2838560 100644
+--- a/app/src/main/java/com/dschat/app/ui/ChatScreen.kt
++++ b/app/src/main/java/com/dschat/app/ui/ChatScreen.kt
+@@ -3,6 +3,8 @@ package com.dschat.app.ui
+ import androidx.activity.compose.rememberLauncherForActivityResult
+ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
+ import androidx.compose.foundation.border
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.gestures.awaitEachGesture
+@@ -31,6 +33,7 @@ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.filled.Send
+ import androidx.compose.material.icons.filled.Add
+ import androidx.compose.material.icons.filled.Close
++import androidx.compose.material.icons.filled.Compress
+ import androidx.compose.material.icons.filled.Description
+ import androidx.compose.material.icons.filled.Keyboard
+ import androidx.compose.material.icons.filled.KeyboardArrowDown
+@@ -47,6 +50,7 @@ import androidx.compose.material3.IconButton
+ import androidx.compose.material3.ModalDrawerSheet
+ import androidx.compose.material3.ModalNavigationDrawer
+ import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
+ import androidx.compose.material3.rememberDrawerState
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+@@ -294,6 +298,9 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
+     val streaming = streamingId != null && streamingId == session?.id
+     val autoRead by vm.autoRead.collectAsState()
+     val readingId by vm.readingId.collectAsState()
++    val compressing by vm.compressing.collectAsState()
++    var showSummaryDialog by remember { mutableStateOf(false) }
++    val contextSummary = session?.contextSummary
+ 
+     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+         if (uris.isNotEmpty()) vm.addDrafts(uris)
+@@ -325,30 +332,44 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
+     // 编辑用户消息
+     var editing by remember { mutableStateOf<com.dschat.app.data.ChatMessage?>(null) }
+ 
+-    // 底部锁定：默认锁定；仅用户亲自上滑才解锁；发送新消息重新锁定
+-    var bottomLocked by remember { mutableStateOf(true) }
+-    val isAtBottom by remember { derivedStateOf { !listState.canScrollForward } }
++    // 底部跟随：默认跟随；只有用户亲手拖动才停止；回到底部自动恢复。
++    // 旧实现用 !canScrollForward 判断贴底，条目高度异步变化时会在「贴底/不贴底」间来回翻转，
++    // 表现为界面闪烁、上滑跳跃。
++    var followBottom by remember { mutableStateOf(true) }
++    val isAtBottom by remember {
++        derivedStateOf {
++            val info = listState.layoutInfo
++            val last = info.visibleItemsInfo.lastOrNull()
++            last == null || (
++                last.index == messages.lastIndex &&
++                    last.offset + last.size <= info.viewportEndOffset + 4
++                )
++        }
++    }
+     val lastTick = messages.lastOrNull()?.let { m ->
+         m.blocks.size * 100000 + m.replyText.length +
+             m.blocks.sumOf { if (it is com.dschat.app.data.ReplyBlock.Thinking) it.thinking.length else 0 }
+     } ?: 0
+ 
+-    // 仅用户真正拖动才解锁；思考折叠/程序滚动引起的高度变化不解锁（避免输出阶段脱底）
++    // 仅用户真正拖动才停止跟随；程序滚动/内容增高不打断（避免输出阶段脱底）
+     val isDragged by listState.interactionSource.collectIsDraggedAsState()
+     LaunchedEffect(isDragged) {
+-        if (isDragged) bottomLocked = false
++        if (isDragged) followBottom = false
++    }
++    LaunchedEffect(isAtBottom, isDragged) {
++        if (isAtBottom && !isDragged) followBottom = true
+     }
+-    // 发送新消息（条数增加）→ 重新锁定并滚到底
++    // 发送新消息（条数增加）→ 重新跟随并滚到底
+     LaunchedEffect(messages.size) {
+         if (messages.isNotEmpty()) {
+-            bottomLocked = true
++            followBottom = true
+             listState.animateScrollToItem(messages.lastIndex, Int.MAX_VALUE)
+         }
+     }
+-    // 流式增长：仅在锁定时跟随
+-    LaunchedEffect(lastTick) {
+-        if (messages.isNotEmpty() && bottomLocked) {
+-            listState.scrollToItem(messages.lastIndex, Int.MAX_VALUE)
++    // 流式增长：跟随期间用 requestScrollToItem（下一帧合并执行），避免逐 token 抢占滚动导致抖动
++    LaunchedEffect(lastTick, followBottom) {
++        if (messages.isNotEmpty() && followBottom) {
++            listState.requestScrollToItem(messages.lastIndex, Int.MAX_VALUE)
+         }
+     }
+ 
+@@ -383,6 +404,16 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
+                     maxLines = 1, overflow = TextOverflow.Ellipsis,
+                     modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
+                 )
++                IconButton(
++                    onClick = { vm.compressContextNow() },
++                    enabled = messages.isNotEmpty() && !streaming && !compressing,
++                ) {
++                    Icon(
++                        Icons.Filled.Compress,
++                        "压缩上下文",
++                        tint = if (messages.isNotEmpty() && !streaming) ds.labelPrimary else ds.labelDimmed,
++                    )
++                }
+                 IconButton(onClick = { vm.setAutoRead(!autoRead) }) {
+                     Icon(
+                         if (autoRead) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff,
+@@ -406,6 +437,28 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
+                         modifier = Modifier.fillMaxSize(),
+                         contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 8.dp),
+                     ) {
++                        contextSummary?.let { sum ->
++                            item(key = "context-summary") {
++                                Row(
++                                    modifier = Modifier
++                                        .fillMaxWidth()
++                                        .padding(vertical = 6.dp)
++                                        .clickable { showSummaryDialog = true },
++                                    verticalAlignment = Alignment.CenterVertically,
++                                ) {
++                                    Icon(
++                                        Icons.Filled.Compress, null,
++                                        tint = ds.labelTertiary,
++                                        modifier = Modifier.size(14.dp),
++                                    )
++                                    Spacer(Modifier.width(6.dp))
++                                    Text(
++                                        "更早 ${sum.covered} 轮对话已压缩为摘要 · 点击查看",
++                                        fontSize = 13.sp, color = ds.labelSecondary,
++                                    )
++                                }
++                            }
++                        }
+                         itemsIndexed(messages, key = { _, m -> m.id }) { index, message ->
+                             if (message.role == "user") {
+                                 UserMessageView(
+@@ -440,7 +493,7 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
+                         androidx.compose.material3.Surface(
+                             shape = CircleShape, color = ds.layer3, shadowElevation = 4.dp,
+                             modifier = Modifier.size(36.dp).clickable {
+-                                bottomLocked = true
++                                followBottom = true
+                                 scope.launch { listState.animateScrollToItem(messages.lastIndex, Int.MAX_VALUE) }
+                             },
+                         ) {
+@@ -455,6 +508,26 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
+             Column(
+                 modifier = Modifier.fillMaxWidth().imePadding().padding(horizontal = 12.dp),
+             ) {
++                if (compressing) {
++                    Row(
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .background(ds.tag, RoundedCornerShape(8.dp))
++                            .padding(horizontal = 10.dp, vertical = 8.dp),
++                        verticalAlignment = Alignment.CenterVertically,
++                    ) {
++                        androidx.compose.material3.CircularProgressIndicator(
++                            modifier = Modifier.size(14.dp),
++                            strokeWidth = 2.dp,
++                            color = ds.brand,
++                        )
++                        Spacer(Modifier.width(8.dp))
++                        Text(
++                            "正在压缩上下文，请稍候…",
++                            fontSize = 13.sp, color = ds.labelSecondary,
++                        )
++                    }
++                }
+                 ChatInputBar(
+                     streaming = streaming,
+                     thinking = thinking,
+@@ -498,6 +571,28 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
+     }
+ 
+     // 编辑用户消息弹窗：修改后 fork 新分支重答
++    if (showSummaryDialog && contextSummary != null) {
++        androidx.compose.material3.AlertDialog(
++            onDismissRequest = { showSummaryDialog = false },
++            title = { Text("更早对话的摘要", fontSize = 16.sp) },
++            text = {
++                Column(
++                    modifier = Modifier
++                        .heightIn(max = 360.dp)
++                        .verticalScroll(rememberScrollState()),
++                ) {
++                    Text(contextSummary.text, fontSize = 14.sp, lineHeight = 22.sp, color = ds.labelPrimary)
++                }
++            },
++            confirmButton = {
++                TextButton(onClick = { showSummaryDialog = false }) { Text("关闭") }
++            },
++            dismissButton = {
++                TextButton(onClick = { vm.clearContextSummary(); showSummaryDialog = false }) { Text("取消压缩") }
++            },
++        )
++    }
++
+     editing?.let { msg ->
+         var editText by remember(msg.id) { mutableStateOf(msg.content) }
+         androidx.compose.material3.AlertDialog(
+diff --git a/app/src/main/java/com/dschat/app/ui/ChatViewModel.kt b/app/src/main/java/com/dschat/app/ui/ChatViewModel.kt
+index 1ce7a7d..7f3bdc2 100644
+--- a/app/src/main/java/com/dschat/app/ui/ChatViewModel.kt
++++ b/app/src/main/java/com/dschat/app/ui/ChatViewModel.kt
+@@ -13,6 +13,8 @@ import androidx.lifecycle.viewModelScope
+ import com.dschat.app.BuildConfig
+ import com.dschat.app.DeepSeekApp
+ import com.dschat.app.data.ChatMessage
++import com.dschat.app.data.ContextCompressor
++import com.dschat.app.data.ContextSummary
+ import com.dschat.app.data.FileMeta
+ import com.dschat.app.data.HistoryArchive
+ import com.dschat.app.data.ReplyBlock
+@@ -28,6 +30,7 @@ import com.dschat.app.net.AttachmentRules
+ import com.dschat.app.net.DeepSeekClient
+ import com.dschat.app.net.RequestBuilder
+ import com.dschat.app.net.StreamEvent
++import com.dschat.app.net.SummaryApi
+ import com.dschat.app.net.UpdateChecker
+ import com.dschat.app.net.classifyError
+ import com.dschat.app.net.isRetryable
+@@ -99,6 +102,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+     private val _busy = MutableStateFlow(false)
+     val busy: StateFlow<Boolean> = _busy
+ 
++    /** 正在压缩上下文（网络请求中），UI 用于禁用发送并提示 */
++    private val _compressing = MutableStateFlow(false)
++    val compressing: StateFlow<Boolean> = _compressing
++
+     // ---- 朗读 ----
+     val tts = TtsPlayer(viewModelScope)
+     private val _readingId = MutableStateFlow<String?>(null)
+@@ -276,6 +283,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+         val content = text.trim()
+         val drafts = _drafts.value
+         if ((content.isEmpty() && drafts.isEmpty()) || _streamingSessionId.value != null) return
++        if (_compressing.value) { toast("正在压缩上下文，请稍候"); return }
+         val apiKey = settings.apiKey
+         if (apiKey == null) { toast("请先设置 API Key"); return }
+         stopReadAloud()
+@@ -321,7 +329,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+     /** 编辑用户消息：fork 成新兄弟分支并重新回答（官方 edit 语义） */
+     fun editUserMessage(messageId: String, newContent: String) {
+         val session = _active.value?.normalized() ?: return
+-        if (_streamingSessionId.value != null) return
++        if (_streamingSessionId.value != null || _compressing.value) return
+         val apiKey = settings.apiKey ?: return
+         val original = session.messages.find { it.id == messageId } ?: return
+         if (original.role != "user") return
+@@ -359,7 +367,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+     /** 重新生成：在同一提问下新建兄弟分支（官方 appendBranch 语义） */
+     fun regenerate(assistantId: String) {
+         val session = _active.value?.normalized() ?: return
+-        if (_streamingSessionId.value != null) return
++        if (_streamingSessionId.value != null || _compressing.value) return
+         val apiKey = settings.apiKey ?: return
+         val original = session.messages.find { it.id == assistantId } ?: return
+         if (original.role != "assistant") return
+@@ -411,7 +419,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+     /** 继续生成（停止或达到长度上限的回复） */
+     fun continueLast() {
+         val session = _active.value?.normalized() ?: return
+-        if (_streamingSessionId.value != null) return
++        if (_streamingSessionId.value != null || _compressing.value) return
+         val apiKey = settings.apiKey ?: return
+         val visible = session.visibleMessages()
+         val last = visible.lastOrNull() ?: return
+@@ -427,6 +435,71 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+         startStream(base, question, assistant, prefix = last, apiKey = apiKey)
+     }
+ 
++    /** 手动压缩当前对话的更早上下文（也用于验证压缩效果） */
++    fun compressContextNow() {
++        val session = _active.value?.normalized() ?: return
++        if (_streamingSessionId.value != null || _compressing.value) return
++        val apiKey = settings.apiKey ?: run { toast("请先设置 API Key"); return }
++        val history = session.visibleMessages()
++        viewModelScope.launch {
++            _compressing.value = true
++            try {
++                val plan = ContextCompressor.plan(history)
++                if (plan == null) {
++                    toast("对话不足 ${ContextCompressor.KEEP_RECENT_PAIRS} 轮，暂不需要压缩")
++                    return@launch
++                }
++                toast("正在压缩 ${plan.coveredPairs} 轮更早对话…")
++                val text = withContext(Dispatchers.IO) { SummaryApi.summarize(apiKey, plan.transcript) }.trim()
++                if (text.isBlank()) {
++                    toast("压缩结果为空，未做修改")
++                    return@launch
++                }
++                val current = _active.value ?: return@launch
++                if (current.id != session.id) return@launch
++                // 压缩期间会话可能被改动（发送/编辑），确认可见消息没变再写回
++                if (current.visibleMessages().map { it.id } != history.map { it.id }) {
++                    toast("对话已发生变化，已取消本次压缩")
++                    return@launch
++                }
++                val updated = current.copy(
++                    contextSummary = ContextSummary(
++                        text = ContextCompressor.clampSummary(text),
++                        cutoffId = plan.cutoffId,
++                        fingerprint = plan.fingerprint,
++                        covered = plan.coveredPairs,
++                        createdAt = System.currentTimeMillis(),
++                    ),
++                    updatedAt = System.currentTimeMillis(),
++                )
++                _active.value = updated
++                upsertMeta(updated)
++                persistActive(force = true)
++                toast("已压缩 ${plan.coveredPairs} 轮更早对话")
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Throwable) {
++                com.dschat.app.util.AppLog.log("compress", "manual failed: ${e.message}")
++                toast("压缩失败：${e.message ?: "请稍后再试"}")
++            } finally {
++                _compressing.value = false
++            }
++        }
++    }
++
++    /** 取消压缩，之后按完整上下文发送 */
++    fun clearContextSummary() {
++        val session = _active.value ?: return
++        if (_streamingSessionId.value != null) return
++        val updated = session.copy(contextSummary = null, updatedAt = System.currentTimeMillis())
++        _active.value = updated
++        upsertMeta(updated)
++        viewModelScope.launch {
++            persistActive(force = true)
++            toast("已取消上下文压缩")
++        }
++    }
++
+     fun stop() {
+         streamJob?.cancel()
+     }
+@@ -488,6 +561,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+             var fileRetryUsed = false
+             var finished = false
+             var currentBase = base
++            var lastUsageTotal = 0
+ 
+             fun pushReply() {
+                 updateActive { s ->
+@@ -502,25 +576,76 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+                 }
+             }
+ 
++            // 上下文接近上限时先压缩更早的对话；失败则按原样发送（绝不修改历史内容）
++            try {
++                val preVisible = currentBase.visibleMessages()
++                val preHistory = preVisible.dropLast(2)
++                if (ContextCompressor.shouldCompress(currentBase, preHistory)) {
++                    val plan = ContextCompressor.plan(preHistory)
++                    if (plan != null) {
++                        _compressing.value = true
++                        toast("上下文接近上限，正在压缩更早的对话…")
++                        try {
++                            val summaryText = withContext(Dispatchers.IO) {
++                                SummaryApi.summarize(apiKey, plan.transcript)
++                            }.trim()
++                            if (summaryText.isNotBlank()) {
++                                currentBase = currentBase.copy(
++                                    contextSummary = ContextSummary(
++                                        text = ContextCompressor.clampSummary(summaryText),
++                                        cutoffId = plan.cutoffId,
++                                        fingerprint = plan.fingerprint,
++                                        covered = plan.coveredPairs,
++                                        createdAt = System.currentTimeMillis(),
++                                    ),
++                                )
++                                _active.value = currentBase
++                                persistActive(force = true)
++                                toast("已压缩 ${plan.coveredPairs} 轮更早对话")
++                            }
++                        } catch (e: CancellationException) {
++                            throw e
++                        } catch (e: Throwable) {
++                            com.dschat.app.util.AppLog.log("compress", "auto failed ${e.javaClass.simpleName}: ${e.message}")
++                            toast("上下文压缩失败，本次按原样发送")
++                        } finally {
++                            _compressing.value = false
++                        }
++                    }
++                }
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Throwable) {
++                com.dschat.app.util.AppLog.log("compress", "precheck failed: ${e.message}")
++            }
++
+             try {
+                 while (!finished) {
+                     try {
+-                        // 与官方 demo 一致：全量可用轮次进入上下文（不做截断）
++                        // 与官方 demo 一致：全量可用轮次进入上下文（不做截断）；
++                        // 若已有有效摘要，则只发送摘要 + 截断点之后的原文
+                         val visible = currentBase.visibleMessages()
+                         val liveQuestion = visible.find { it.id == question.id } ?: question
+                         val history = visible.dropLast(2)
++                        val appliedSummary = ContextCompressor.apply(currentBase, history)
++                        val requestHistory = appliedSummary?.history ?: history
++                        val summaryText = appliedSummary?.summary
+                         // 补传附件；个别图片上传失败时跳过该图，不阻断整次发送
+-                        currentBase = ensureUploaded(currentBase, history + liveQuestion)
++                        currentBase = ensureUploaded(currentBase, requestHistory + liveQuestion)
+                         _active.value = currentBase
+-                        val messages = RequestBuilder.toRequestMessages(history, liveQuestion, prefix, reply.thinking)
+-                        val hasFiles = RequestBuilder.hasFileBlocks(history, liveQuestion)
+-                        val body = RequestBuilder.buildBody(messages, reply.thinking, reply.search, requestTitle && currentBase.title.isBlank())
++                        val messages = RequestBuilder.toRequestMessages(requestHistory, liveQuestion, prefix, reply.thinking)
++                        val hasFiles = RequestBuilder.hasFileBlocks(requestHistory, liveQuestion)
++                        val body = RequestBuilder.buildBody(messages, reply.thinking, reply.search, requestTitle && currentBase.title.isBlank(), summary = summaryText)
+                         com.dschat.app.util.AppLog.log("send", "session=$sessionId thinking=${reply.thinking} search=${reply.search} historyRounds=${history.size / 2} hasFiles=$hasFiles attempt=$attempt")
+ 
+                         DeepSeekClient.streamMessage(apiKey, body, hasFiles).collect { event ->
+                             receivedContent = receivedContent || event is StreamEvent.BlockStart
+                             when (event) {
+-                                is StreamEvent.MessageStart -> com.dschat.app.util.AppLog.log("usage", "message_start ${fmtUsage(event.usage)}")
++                                is StreamEvent.MessageStart -> {
++                                    val total = usageTotal(event.usage)
++                                    if (total > 0) lastUsageTotal = total
++                                    com.dschat.app.util.AppLog.log("usage", "message_start ${fmtUsage(event.usage)}")
++                                }
+                                 is StreamEvent.BlockStart -> {
+                                     val bt = event.block["type"]?.toString() ?: ""
+                                     if (bt.contains("server_tool_use")) {
+@@ -581,6 +706,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+                         finished = true
+                     }
+                 }
++                if (lastUsageTotal > 0) {
++                    updateActive { s -> if (s.id == sessionId) s.copy(lastInputTokens = lastUsageTotal) else s }
++                }
+                 pushReply()
+                 persistActive(force = true)
+             } catch (_: CancellationException) {
+@@ -602,6 +730,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
+         ApiCondition.OTHER -> (e.message?.takeIf { it.isNotBlank() } ?: "未知错误")
+     }
+ 
++    /** 上下文总量 = 输入 + 缓存命中 + 缓存写入 */
++    private fun usageTotal(u: JsonObject?): Int {
++        if (u == null) return 0
++        fun g(k: String) = u[k]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
++        return g("input_tokens") + g("cache_read_input_tokens") + g("cache_creation_input_tokens")
++    }
++
+     private fun fmtUsage(u: JsonObject?): String {
+         if (u == null) return "usage=null"
+         fun g(k: String) = u[k]?.jsonPrimitive?.content ?: "0"
+diff --git a/app/src/main/java/com/dschat/app/ui/MessageViews.kt b/app/src/main/java/com/dschat/app/ui/MessageViews.kt
+index 4564f0d..111c910 100644
+--- a/app/src/main/java/com/dschat/app/ui/MessageViews.kt
++++ b/app/src/main/java/com/dschat/app/ui/MessageViews.kt
+@@ -365,6 +365,30 @@ fun SearchSection(block: ReplyBlock.Search) {
+     }
+ }
+ 
++private val MERMAID_FENCE = Regex("(?m)^\\s*```\\s*mermaid")
++
++/**
++ * 助手正文渲染：
++ * - 普通 Markdown 走原生 Markwon（高度同步测量，滚动不跳、无 WebView 白闪）；
++ * - 只有含 ```mermaid 的消息才用 WebView（图表必须网页渲染）。
++ * 之前每条回复都建 WebView，异步回传高度会让列表在滚动/流式时不断跳动。
++ */
++@Composable
++private fun AssistantBody(markdown: String) {
++    val ds = LocalDsColors.current
++    if (MERMAID_FENCE.containsMatchIn(markdown)) {
++        RichMarkdown(markdown = markdown, modifier = Modifier.padding(bottom = 6.dp))
++    } else {
++        MarkdownText(
++            markdown = markdown,
++            textColor = ds.labelPrimary.toArgb(),
++            linkColor = ds.brandText.toArgb(),
++            modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
++            textSizeSp = 15f,
++        )
++    }
++}
++
+ /** 助手消息：版本切换 + 思考/搜索 + 富文本正文 + 错误 + 操作行 */
+ @Composable
+ fun AssistantMessageView(
+@@ -414,10 +438,7 @@ fun AssistantMessageView(
+             }
+         }
+         if (textParts.isNotBlank()) {
+-            RichMarkdown(
+-                markdown = textParts.toString().trim(),
+-                modifier = Modifier.padding(bottom = 6.dp),
+-            )
++            AssistantBody(textParts.toString().trim())
+         }
+ 
+         if (message.status == "error" && message.errorText != null) {
+diff --git a/app/src/main/java/com/dschat/app/ui/RichMarkdown.kt b/app/src/main/java/com/dschat/app/ui/RichMarkdown.kt
+index 2a52d0c..224f05c 100644
+--- a/app/src/main/java/com/dschat/app/ui/RichMarkdown.kt
++++ b/app/src/main/java/com/dschat/app/ui/RichMarkdown.kt
+@@ -30,6 +30,11 @@ private fun css(c: Color): String {
+  * 用内置 KaTeX + markdown-it + mermaid 的 WebView 渲染回复，
+  * 与官方 demo 一致地支持 array/颜色/scalebox/中文公式等复杂 LaTeX。
+  * 高度由页面回传，自适应内容。
++ *
++ * 性能约定（长会话卡顿修复）：
++ * - 只有正文变化才重新渲染；重组（滚动/流式/主题）不再全量重排；
++ * - 高度只在真的变化时回写，避免「高度变化 → 重组 → 再渲染」循环；
++ * - 离开组合时销毁 WebView，防止滚动来回累积 WebView 泄漏。
+  */
+ @Composable
+ fun RichMarkdown(markdown: String, modifier: Modifier = Modifier) {
+@@ -37,17 +42,28 @@ fun RichMarkdown(markdown: String, modifier: Modifier = Modifier) {
+     var heightDp by remember { mutableStateOf(0) }
+     var loaded by remember { mutableStateOf(false) }
+     val pending = remember { arrayOfNulls<String>(1) }
++    val rendered = remember { arrayOfNulls<String>(1) }
++    val themeKey = remember { arrayOfNulls<String>(1) }
+ 
+     val fg = css(ds.labelPrimary)
+     val accent = css(ds.brandText)
+     val border = css(ds.borderL2)
+     val codeBg = css(ds.tag)
++    val themeJs = "setTheme('$fg','transparent','$accent','$border','$codeBg')"
++    val themeSignature = "$fg|$accent|$border|$codeBg"
+ 
+     AndroidView(
+         modifier = modifier
+             .fillMaxWidth()
+             .defaultMinSize(minHeight = 4.dp)
+             .then(if (heightDp > 0) Modifier.height(heightDp.dp) else Modifier),
++        onRelease = { wv ->
++            runCatching {
++                wv.stopLoading()
++                wv.loadUrl("about:blank")
++                wv.destroy()
++            }
++        },
+         factory = { ctx ->
+             WebView(ctx).apply {
+                 settings.javaScriptEnabled = true
+@@ -60,14 +76,20 @@ fun RichMarkdown(markdown: String, modifier: Modifier = Modifier) {
+                 addJavascriptInterface(object {
+                     @JavascriptInterface
+                     fun setHeight(h: Int) {
+-                        post { if (h > 0) heightDp = h }
++                        post { if (h > 0 && h != heightDp) heightDp = h }
+                     }
+                 }, "Android")
+                 webViewClient = object : WebViewClient() {
+                     override fun onPageFinished(view: WebView, url: String) {
+                         loaded = true
+-                        view.evaluateJavascript("setTheme('$fg','transparent','$accent','$border','$codeBg')", null)
+-                        pending[0]?.let { view.evaluateJavascript("renderMarkdown(${JSONObject.quote(MathNormalizer.normalizeForKatex(it))})", null) }
++                        themeKey[0] = themeSignature
++                        view.evaluateJavascript(themeJs, null)
++                        val text = pending[0]
++                        if (text != null) {
++                            val js = MathNormalizer.normalizeForKatex(text)
++                            rendered[0] = js
++                            view.evaluateJavascript("renderMarkdown(${JSONObject.quote(js)})", null)
++                        }
+                     }
+                     override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean {
+                         runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+@@ -78,12 +100,19 @@ fun RichMarkdown(markdown: String, modifier: Modifier = Modifier) {
+             }
+         },
+         update = { wv ->
+-            if (loaded) {
+-                wv.evaluateJavascript("setTheme('$fg','transparent','$accent','$border','$codeBg')", null)
+-                wv.evaluateJavascript("renderMarkdown(${JSONObject.quote(MathNormalizer.normalizeForKatex(markdown))})", null)
+-            } else {
++            if (!loaded) {
+                 pending[0] = markdown
++                return@AndroidView
++            }
++            if (themeKey[0] != themeSignature) {
++                themeKey[0] = themeSignature
++                wv.evaluateJavascript(themeJs, null)
++            }
++            val js = MathNormalizer.normalizeForKatex(markdown)
++            if (rendered[0] != js) {
++                rendered[0] = js
++                wv.evaluateJavascript("renderMarkdown(${JSONObject.quote(js)})", null)
+             }
+         },
+     )
+-}
+\ No newline at end of file
++}
+diff --git a/app/src/test/java/com/dschat/app/ContextCompressorTest.kt b/app/src/test/java/com/dschat/app/ContextCompressorTest.kt
+new file mode 100644
+index 0000000..4d68f8a
+--- /dev/null
++++ b/app/src/test/java/com/dschat/app/ContextCompressorTest.kt
+@@ -0,0 +1,129 @@
++package com.dschat.app
++
++import com.dschat.app.data.ChatMessage
++import com.dschat.app.data.ContextCompressor
++import com.dschat.app.data.ContextSummary
++import com.dschat.app.data.ReplyBlock
++import com.dschat.app.data.Session
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ContextCompressorTest {
++
++    private fun user(id: String, text: String = "问题 $id") =
++        ChatMessage(id = id, role = "user", createdAt = 0L, content = text, status = "done")
++
++    private fun reply(id: String, text: String = "回答 $id") =
++        ChatMessage(
++            id = id, role = "assistant", createdAt = 0L, status = "done",
++            blocks = listOf(ReplyBlock.Text(text)),
++        )
++
++    private fun round(u: String, a: String, ut: String = "问题 $u", at: String = "回答 $a"): List<ChatMessage> =
++        listOf(user(u, ut), reply(a, at))
++
++    private fun sessionOf(messages: List<ChatMessage>) = Session(
++        id = "s", title = "t", createdAt = 0L, updatedAt = 0L,
++        messages = messages, rootMessageId = messages.firstOrNull()?.id,
++    )
++
++    @Test
++    fun `pairs ignore orphans and unusable replies`() {
++        val history = listOf(
++            user("u1"), reply("a1"),
++            user("u2"), // 没有可用回答，应跳过
++            user("u3"), reply("a3"),
++        )
++        val pairs = ContextCompressor.pairs(history)
++        assertEquals(2, pairs.size)
++        assertEquals("u1", pairs[0].first.id)
++        assertEquals("u3", pairs[1].first.id)
++    }
++
++    @Test
++    fun `plan covers older pairs and apply trims history`() {
++        val history = round("u1", "a1") + round("u2", "a2") + round("u3", "a3") + round("u4", "a4")
++        val plan = ContextCompressor.plan(history, keepPairs = 1)
++        assertNotNull(plan)
++        plan!!
++        assertEquals(3, plan.coveredPairs)
++        assertEquals("a3", plan.cutoffId)
++        assertTrue(plan.transcript.contains("用户：问题 u1"))
++        assertTrue(plan.transcript.contains("助手：回答 a3"))
++        assertFalse(plan.transcript.contains("回答 a4"))
++
++        val session = sessionOf(history).copy(
++            contextSummary = ContextSummary(plan.transcript, plan.cutoffId, plan.fingerprint, plan.coveredPairs),
++        )
++        val applied = ContextCompressor.apply(session, history)
++        assertNotNull(applied)
++        assertEquals(listOf("u4", "a4"), applied!!.history.map { it.id })
++    }
++
++    @Test
++    fun `apply rejects stale summary`() {
++        val history = round("u1", "a1") + round("u2", "a2") + round("u3", "a3") + round("u4", "a4")
++        val plan = ContextCompressor.plan(history, keepPairs = 1)!!
++        val session = sessionOf(history).copy(
++            contextSummary = ContextSummary(plan.transcript, plan.cutoffId, plan.fingerprint, plan.coveredPairs),
++        )
++
++        // cutoff 被删除（分支切换）
++        assertNull(ContextCompressor.apply(session, history.filterNot { it.id == "a3" }))
++
++        // 前缀内容被替换（同数量但 id 不同 → 指纹不同）
++        val edited = listOf(user("x1"), reply("x1r")) + history.drop(2)
++        assertNull(ContextCompressor.apply(session, edited))
++    }
++
++    @Test
++    fun `shouldCompress respects threshold and existing summary`() {
++        val history = round("u1", "a1") + round("u2", "a2")
++        val base = sessionOf(history)
++        assertFalse(ContextCompressor.shouldCompress(base, history))
++
++        val nearLimit = base.copy(lastInputTokens = (ContextCompressor.CONTEXT_LIMIT_TOKENS * 0.96).toInt())
++        assertTrue(ContextCompressor.shouldCompress(nearLimit, history))
++
++        val plan = ContextCompressor.plan(history, keepPairs = 0)!!
++        val withSummary = nearLimit.copy(
++            contextSummary = ContextSummary(plan.transcript, plan.cutoffId, plan.fingerprint, plan.coveredPairs),
++        )
++        assertFalse(ContextCompressor.shouldCompress(withSummary, history))
++    }
++
++    @Test
++    fun `estimate counts only what is sent`() {
++        val history = listOf(
++            user("u", "a".repeat(1600)),
++            ChatMessage(
++                id = "a", role = "assistant", createdAt = 0L, status = "done",
++                blocks = listOf(
++                    ReplyBlock.Text("b".repeat(1600)),
++                    ReplyBlock.Thinking("思考内容".repeat(1000)),
++                ),
++            ),
++        )
++        val tokens = ContextCompressor.estimateTokens(history)
++        // 3200 字符 / 1.6 = 2000，加 system 余量
++        assertEquals(3500, tokens)
++    }
++
++    @Test
++    fun `plan needs enough pairs`() {
++        val history = round("u1", "a1") + round("u2", "a2")
++        assertNull(ContextCompressor.plan(history, keepPairs = 1))
++        assertNull(ContextCompressor.plan(history, keepPairs = 5))
++    }
++
++    @Test
++    fun `clampSummary caps length`() {
++        val long = "x".repeat(ContextCompressor.MAX_SUMMARY_CHARS + 100)
++        val clamped = ContextCompressor.clampSummary(long)
++        assertTrue(clamped.length <= ContextCompressor.MAX_SUMMARY_CHARS + 1)
++    }
++}
+diff --git a/gradle.properties b/gradle.properties
+index 1a30e4b..7af432f 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,8 +1,11 @@
+-org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
++org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+ org.gradle.parallel=true
+ org.gradle.caching=true
+ android.useAndroidX=true
+ android.nonTransitiveRClass=true
+ kotlin.code.style=official
+ # 如需固定 JDK（本机为 Temurin 17），取消下一行注释：
+-# org.gradle.java.home=C:\\Users\\OMEN\\.gradle\\jdks\\eclipse_adoptium-17-amd64-windows.2
+\ No newline at end of file
++# org.gradle.java.home=C:\\Users\\OMEN\\.gradle\\jdks\\eclipse_adoptium-17-amd64-windows.2
++kotlin.daemon.jvmargs=-Xmx1024m -XX:MaxMetaspaceSize=512m
++org.gradle.workers.max=4
++android.aapt2FromMavenOverride=/opt/x86tools/aapt2
+diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
+index 6514f91..ca025c8 100644
+--- a/gradle/wrapper/gradle-wrapper.properties
++++ b/gradle/wrapper/gradle-wrapper.properties
+@@ -1,6 +1,6 @@
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+-distributionUrl=https\://services.gradle.org/distributions/gradle-8.14-all.zip
++distributionUrl=https\://services.gradle.org/distributions/gradle-8.14-bin.zip
+ networkTimeout=10000
+ validateDistributionUrl=true
+ zipStoreBase=GRADLE_USER_HOME
